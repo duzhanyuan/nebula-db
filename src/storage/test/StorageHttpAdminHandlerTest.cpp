@@ -7,9 +7,10 @@
 #include "base/Base.h"
 #include <gtest/gtest.h>
 #include <folly/json.h>
+#include "webservice/Router.h"
 #include "webservice/WebService.h"
 #include "webservice/test/TestUtils.h"
-#include "storage/StorageHttpAdminHandler.h"
+#include "storage/http/StorageHttpAdminHandler.h"
 #include "storage/test/TestUtils.h"
 #include "fs/TempDir.h"
 
@@ -27,22 +28,27 @@ public:
         rootPath_ = std::make_unique<fs::TempDir>("/tmp/StorageHttpAdminHandler.XXXXXX");
         kv_ = TestUtils::initKV(rootPath_->path());
         schemaMan_ = TestUtils::mockSchemaMan();
+
         VLOG(1) << "Starting web service...";
-        WebService::registerHandler("/admin", [this] {
+        webSvc_ = std::make_unique<WebService>();
+        auto& router = webSvc_->router();
+        router.get("/admin").handler([this](nebula::web::PathParams&&) {
             return new storage::StorageHttpAdminHandler(schemaMan_.get(), kv_.get());
         });
-        auto status = WebService::start();
+        auto status = webSvc_->start();
         ASSERT_TRUE(status.ok()) << status;
     }
 
     void TearDown() override {
-        WebService::stop();
+        webSvc_.reset();
         schemaMan_.reset();
         kv_.reset();
         rootPath_.reset();
         VLOG(1) << "Web service stopped";
     }
 
+protected:
+    std::unique_ptr<WebService> webSvc_;
     std::unique_ptr<kvstore::KVStore> kv_;
     std::unique_ptr<fs::TempDir> rootPath_;
     std::unique_ptr<meta::SchemaManager> schemaMan_;
@@ -51,34 +57,52 @@ public:
 
 TEST(StoragehHttpAdminHandlerTest, AdminTest) {
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin", resp));
-        ASSERT_EQ(0, resp.find("Space should not be empty"));
+        auto url = "/admin";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ(0, resp.value().find("Space should not be empty"));
     }
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin?space=xx", resp));
-        ASSERT_EQ(0, resp.find("Op should not be empty"));
+        auto url = "/admin?space=xx";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ(0, resp.value().find("Op should not be empty"));
     }
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin?space=xx&op=yy", resp));
-        ASSERT_EQ(0, resp.find("Can't find space xx"));
+        auto url = "/admin?space=xx&op=yy";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ(0, resp.value().find("Can't find space xx"));
     }
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin?space=0&op=yy", resp));
-        ASSERT_EQ(0, resp.find("Unknown operation yy"));
+        auto url = "/admin?space=0&op=yy";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ(0, resp.value().find("Unknown operation yy"));
     }
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin?space=0&op=flush", resp));
-        ASSERT_EQ("ok", resp);
+        auto url = "/admin?space=0&op=flush";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ("ok", resp.value());
     }
     {
-        std::string resp;
-        ASSERT_TRUE(getUrl("/admin?space=0&op=compact", resp));
-        ASSERT_EQ("ok", resp);
+        auto url = "/admin?space=0&op=compact";
+        auto request = folly::stringPrintf("http://%s:%d%s", FLAGS_ws_ip.c_str(),
+                                           FLAGS_ws_http_port, url);
+        auto resp = http::HttpClient::get(request);
+        ASSERT_TRUE(resp.ok());
+        ASSERT_EQ("ok", resp.value());
     }
 }
 
@@ -95,4 +119,3 @@ int main(int argc, char** argv) {
 
     return RUN_ALL_TESTS();
 }
-

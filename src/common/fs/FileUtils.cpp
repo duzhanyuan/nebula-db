@@ -8,6 +8,8 @@
 #include "fs/FileUtils.h"
 #include <dirent.h>
 #include <fnmatch.h>
+#include <limits.h>
+#include <stdlib.h>
 
 namespace nebula {
 namespace fs {
@@ -17,61 +19,60 @@ static const int32_t kMaxPathLen = 1024;
 namespace detail {
 
 bool removeDir(const char* path, bool recursively) {
-    if (recursively) {
-        // Assuming the path is a directory
-        DIR* dh = opendir(path);
-        if (!dh) {
-            LOG(ERROR) << "Failed to read the directory \"" << path
-                       << "\" (" << errno << "): " << strerror(errno);
-            return false;
+    // Assuming the path is a directory
+    DIR *dh = opendir(path);
+    if (!dh) {
+        LOG(ERROR) << "Failed to read the directory \"" << path
+                   << "\" (" << errno << "): " << strerror(errno);
+        return false;
+    }
+
+    bool succeeded = true;
+    struct dirent *dEnt;
+    errno = 0;
+    while (succeeded && !!(dEnt = readdir(dh))) {
+        if (!strcmp(dEnt->d_name, ".") || !strcmp(dEnt->d_name, "..")) {
+            // Skip "." and ".."
+            continue;
         }
 
-        bool succeeded = true;
-        struct dirent* dEnt;
-        errno = 0;
-        while (succeeded && !!(dEnt = readdir(dh))) {
-            if (!strcmp(dEnt->d_name, ".") || !strcmp(dEnt->d_name, "..")) {
-                // Skip "." and ".."
-                continue;
-            }
-            if (dEnt->d_type == DT_DIR && !recursively) {
-                LOG(ERROR) << "Cannot remove the directory \"" << path
-                           << "\" because it contains sub-directory \""
-                           << dEnt->d_name << "\"";
-                succeeded = false;
-            } else {
-                // Remove the directory entry
-                succeeded = FileUtils::remove(
-                    FileUtils::joinPath(path, dEnt->d_name).c_str(), recursively);
-                if (!succeeded) {
-                    LOG(ERROR) << "Failed to remove \"" << dEnt->d_name
-                               << "\" in \"" << path
-                               << "\"";
-                } else {
-                    VLOG(2) << "Succeeded removing \"" << dEnt->d_name << "\"";
-                }
-            }
-        }
-
-        if (succeeded && errno) {
-            // There is an error
-            LOG(ERROR) << "Failed to read the directory \"" << path
-                       << "\" (" << errno << "): " << strerror(errno);
+        if (FileUtils::isDir(dEnt, path) && !recursively) {
+            LOG(ERROR) << "Cannot remove the directory \"" << path
+                       << "\" because it contains sub-directory \""
+                       << dEnt->d_name << "\"";
             succeeded = false;
+        } else {
+            // Remove the directory entry, recursive call
+            succeeded = FileUtils::remove(
+                FileUtils::joinPath(path, dEnt->d_name).c_str(), recursively);
+            if (!succeeded) {
+                LOG(ERROR) << "Failed to remove \"" << dEnt->d_name
+                           << "\" in \"" << path
+                           << "\"";
+            } else {
+                VLOG(2) << "Succeeded removing \"" << dEnt->d_name << "\"";
+            }
         }
+    }
 
-        if (closedir(dh)) {
-            // Failed to close the directory stream
-            LOG(ERROR) << "Failed to close the directory stream (" << errno
-                       << "): " << strerror(errno);
-            return false;
-        }
+    if (succeeded && errno) {
+        // There is an error
+        LOG(ERROR) << "Failed to read the directory \"" << path
+                   << "\" (" << errno << "): " << strerror(errno);
+        succeeded = false;
+    }
 
-        if (!succeeded) {
-            LOG(ERROR) << "Failed to remove the content of the directory \""
-                       << path << "\"";
-            return false;
-        }
+    if (closedir(dh)) {
+        // Failed to close the directory stream
+        LOG(ERROR) << "Failed to close the directory stream (" << errno
+                   << "): " << strerror(errno);
+        return false;
+    }
+
+    if (!succeeded) {
+        LOG(ERROR) << "Failed to remove the content of the directory \""
+                   << path << "\"";
+        return false;
     }
 
     // All content has been removed, now remove the directory itself
@@ -95,6 +96,15 @@ StatusOr<std::string> FileUtils::readLink(const char *path) {
     return std::string(buffer, len);
 }
 
+StatusOr<std::string> FileUtils::realPath(const char *path) {
+    char *buffer  = ::realpath(path, NULL);
+    if (buffer == NULL) {
+        return Status::Error("realpath %s: %s", path, ::strerror(errno));
+    }
+    std::string truePath(buffer);
+    ::free(buffer);
+    return truePath;
+}
 
 std::string FileUtils::dirname(const char *path) {
     DCHECK(path != nullptr && *path != '\0');
@@ -146,7 +156,7 @@ size_t FileUtils::fileSize(const char* path) {
     struct stat st;
     if (lstat(path, &st)) {
         // Failed o get file stat
-        VLOG(3) << "Failed to get infomation about \"" << path
+        VLOG(3) << "Failed to get information about \"" << path
                 << "\" (" << errno << "): " << strerror(errno);
         return 0;
     }
@@ -163,7 +173,7 @@ FileType FileUtils::fileType(const char* path) {
             return FileType::NOTEXIST;
         } else {
             // Failed o get file stat
-            VLOG(3) << "Failed to get infomation about \"" << path
+            VLOG(3) << "Failed to get information about \"" << path
                     << "\" (" << errno << "): " << strerror(errno);
             return FileType::UNKNOWN;
         }
@@ -193,7 +203,7 @@ int64_t FileUtils::fileLastUpdateTime(const char* path) {
     struct stat st;
     if (lstat(path, &st)) {
         // Failed to get file stat
-        LOG(ERROR) << "Failed to get file infomation for \"" << path
+        LOG(ERROR) << "Failed to get file information for \"" << path
                    << "\" (" << errno << "): " << strerror(errno);
         return -1;
     }
@@ -315,12 +325,12 @@ bool FileUtils::remove(const char* path, bool recursively) {
 }
 
 
-bool FileUtils::makeDir(const std::string& dir) {
+bool FileUtils::makeDir(const std::string& dir, uint32_t mode) {
     if (dir.empty()) {
         return false;
     }
     FileType type = fileType(dir.c_str());
-    if (type == FileType::DIRECTORY) {
+    if (type == FileType::DIRECTORY || type == FileType::SYM_LINK) {
         // The directory already exists
         return true;
     } else if (type != FileType::NOTEXIST) {
@@ -334,19 +344,33 @@ bool FileUtils::makeDir(const std::string& dir) {
 
     // create parent if it is not empty
     if (!parent.empty()) {
-        bool ret = makeDir(parent.toString());
+        bool ret = makeDir(parent.toString(), mode);
         if (!ret) {
             return false;
         }
     }
 
-    int err = mkdir(dir.c_str(), S_IRWXU);
+    int err = mkdir(dir.c_str(), mode);
     if (err != 0) {
         return fileType(dir.c_str()) == FileType::DIRECTORY;
     }
     return true;
 }
 
+bool FileUtils::exist(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    return access(path.c_str(), F_OK) == 0;
+}
+
+// static
+bool FileUtils::rename(const std::string& src, const std::string& dst) {
+    auto status = ::rename(src.c_str(), dst.c_str());
+    LOG_IF(WARNING, status != 0) << "Rename " << src << " to " << dst << " failed, the errno: "
+        << ::strerror(errno);
+    return status == 0;
+}
 
 std::vector<std::string> FileUtils::listAllTypedEntitiesInDir(
         const char* dirpath,
@@ -363,13 +387,13 @@ std::vector<std::string> FileUtils::listAllTypedEntitiesInDir(
     }
 
     while ((dirInfo = readdir(dir)) != nullptr) {
-        if ((type == FileType::REGULAR && dirInfo->d_type == DT_REG) ||
-            (type == FileType::DIRECTORY && dirInfo->d_type == DT_DIR) ||
-            (type == FileType::SYM_LINK && dirInfo->d_type == DT_LNK) ||
-            (type == FileType::CHAR_DEV && dirInfo->d_type == DT_CHR) ||
-            (type == FileType::BLOCK_DEV && dirInfo->d_type == DT_BLK) ||
-            (type == FileType::FIFO && dirInfo->d_type == DT_FIFO) ||
-            (type == FileType::SOCKET && dirInfo->d_type == DT_SOCK)) {
+        if ((type == FileType::REGULAR && FileUtils::isReg(dirInfo, dirpath)) ||
+            (type == FileType::DIRECTORY && FileUtils::isDir(dirInfo, dirpath)) ||
+            (type == FileType::SYM_LINK && FileUtils::isLink(dirInfo, dirpath)) ||
+            (type == FileType::CHAR_DEV && FileUtils::isChr(dirInfo, dirpath)) ||
+            (type == FileType::BLOCK_DEV && FileUtils::isBlk(dirInfo, dirpath)) ||
+            (type == FileType::FIFO && FileUtils::isFifo(dirInfo, dirpath)) ||
+            (type == FileType::SOCKET && FileUtils::isSock(dirInfo, dirpath))) {
             if (!strcmp(dirInfo->d_name, ".") || !strcmp(dirInfo->d_name, "..")) {
                 // Skip the "." and ".."
                 continue;
@@ -498,6 +522,14 @@ void FileUtils::Iterator::openFileOrDirectory() {
             status_ = Status::Error("open `%s': %s", path_.c_str(), ::strerror(errno));
             return;
         }
+    } else if (type_ == FileType::SYM_LINK) {
+        auto result = FileUtils::realPath(path_.c_str());
+        if (!result.ok()) {
+            status_ = std::move(result).status();
+            return;
+        }
+        path_ = std::move(result).value();
+        openFileOrDirectory();
     } else {
         status_ = Status::Error("Filetype not supported `%s': %s",
                                 path_.c_str(), FileUtils::getFileTypeName(type_));
@@ -506,6 +538,13 @@ void FileUtils::Iterator::openFileOrDirectory() {
     status_ = Status::OK();
 }
 
+CHECK_TYPE(Reg, REGULAR, REG)
+CHECK_TYPE(Dir, DIRECTORY, DIR)
+CHECK_TYPE(Link, SYM_LINK, LNK)
+CHECK_TYPE(Chr, CHAR_DEV, CHR)
+CHECK_TYPE(Blk, BLOCK_DEV, BLK)
+CHECK_TYPE(Fifo, FIFO, FIFO)
+CHECK_TYPE(Sock, SOCKET, SOCK)
 }  // namespace fs
 }  // namespace nebula
 

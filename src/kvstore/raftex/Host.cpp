@@ -8,14 +8,18 @@
 #include "kvstore/raftex/Host.h"
 #include "kvstore/raftex/RaftPart.h"
 #include "kvstore/wal/FileBasedWal.h"
-#include <folly/io/async/EventBase.h>
 #include "network/NetworkUtils.h"
+#include <folly/io/async/EventBase.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
 
 DEFINE_uint32(max_appendlog_batch_size, 128,
               "The max number of logs in each appendLog request batch");
 DEFINE_uint32(max_outstanding_requests, 1024,
               "The max number of outstanding appendLog requests");
+DEFINE_int32(raft_rpc_timeout_ms, 500, "rpc timeout for raft client");
 
+DECLARE_bool(trace_raft);
+DECLARE_uint32(raft_heartbeat_interval_secs);
 
 namespace nebula {
 namespace raftex {
@@ -64,7 +68,8 @@ cpp2::ErrorCode Host::checkStatus() const {
 
 
 folly::Future<cpp2::AskForVoteResponse> Host::askForVote(
-        const cpp2::AskForVoteRequest& req) {
+        const cpp2::AskForVoteRequest& req,
+        folly::EventBase* eb) {
     {
         std::lock_guard<std::mutex> g(lock_);
         auto res = checkStatus();
@@ -76,7 +81,7 @@ folly::Future<cpp2::AskForVoteResponse> Host::askForVote(
             return resp;
         }
     }
-    auto client = tcManager().client(addr_);
+    auto client = tcManager().client(addr_, eb, false, FLAGS_raft_heartbeat_interval_secs * 1000);
     return client->future_askForVote(req);
 }
 
@@ -90,47 +95,37 @@ folly::Future<cpp2::AppendLogResponse> Host::appendLogs(
         LogID prevLogId) {
     VLOG(3) << idStr_ << "Entering Host::appendLogs()";
 
-    VLOG(3) << idStr_
-            << "Append logs to the host [term = " << term
-            << ", logId = " << logId
-            << ", committedLogId = " << committedLogId
-            << ", lastLogTermSent = " << prevLogTerm
-            << ", lastLogIdSent = " << prevLogId
-            << "]";
-
+    if (FLAGS_trace_raft) {
+        LOG(INFO) << idStr_
+                  << "Append logs to the host [term = " << term
+                  << ", logId = " << logId
+                  << ", committedLogId = " << committedLogId
+                  << ", lastLogTermSent = " << prevLogTerm
+                  << ", lastLogIdSent = " << prevLogId
+                  << "]";
+    }
     auto ret = folly::Future<cpp2::AppendLogResponse>::makeEmpty();
     std::shared_ptr<cpp2::AppendLogRequest> req;
     {
         std::lock_guard<std::mutex> g(lock_);
 
         auto res = checkStatus();
-
-        if (logId == logIdToSend_) {
-            // This is a re-send or a heartbeat. If there is an
-            // ongoing request, we will just return SUCCEEDED
-            if (requestOnGoing_) {
-                VLOG(2) << idStr_ << "Another request is onging,"
-                                     "ignore the re-send request";
-                cpp2::AppendLogResponse r;
-                r.set_error_code(cpp2::ErrorCode::SUCCEEDED);
-                return r;
-            }
-        } else {
-            // Otherwise, logId has to be greater
-            CHECK_GT(logId, logIdToSend_);
+        if (logId <= lastLogIdSent_) {
+            LOG(INFO) << idStr_ << "The log " << logId << " has been sended"
+                      << ", lastLogIdSent " << lastLogIdSent_;
+            cpp2::AppendLogResponse r;
+            r.set_error_code(cpp2::ErrorCode::SUCCEEDED);
+            return r;
         }
 
         if (requestOnGoing_ && res == cpp2::ErrorCode::SUCCEEDED) {
             if (cachingPromise_.size() <= FLAGS_max_outstanding_requests) {
                 pendingReq_ = std::make_tuple(term,
                                               logId,
-                                              committedLogId,
-                                              prevLogTerm,
-                                              prevLogId);
+                                              committedLogId);
                 return cachingPromise_.getFuture();
             } else {
-                VLOG(2) << idStr_
-                        << "Too many requests are waiting, return error";
+                LOG_EVERY_N(INFO, 200) << idStr_ << "Too many requests are waiting, return error";
                 cpp2::AppendLogResponse r;
                 r.set_error_code(cpp2::ErrorCode::E_TOO_MANY_REQUESTS);
                 return r;
@@ -148,14 +143,22 @@ folly::Future<cpp2::AppendLogResponse> Host::appendLogs(
         VLOG(2) << idStr_ << "About to send the AppendLog request";
 
         // No request is ongoing, let's send a new request
-        CHECK_GE(prevLogTerm, lastLogTermSent_);
-        CHECK_GE(prevLogId, lastLogIdSent_);
+        if (UNLIKELY(lastLogIdSent_ == 0 && lastLogTermSent_ == 0)) {
+            lastLogIdSent_ = prevLogId;
+            lastLogTermSent_ = prevLogTerm;
+            LOG(INFO) << idStr_ << "This is the first time to send the logs to this host"
+                      << ", lastLogIdSent = " << lastLogIdSent_
+                      << ", lastLogTermSent = " << lastLogTermSent_;
+        }
+        if (prevLogTerm < lastLogTermSent_ || prevLogId < lastLogIdSent_) {
+            LOG(INFO) << idStr_ << "We have sended this log, so go on from id " << lastLogIdSent_
+                      << ", term " << lastLogTermSent_ << "; current prev log id " << prevLogId
+                      << ", current prev log term " << prevLogTerm;
+        }
         logTermToSend_ = term;
         logIdToSend_ = logId;
-        lastLogTermSent_ = prevLogTerm;
-        lastLogIdSent_ = prevLogId;
         committedLogId_ = committedLogId;
-        pendingReq_ = std::make_tuple(0, 0, 0, 0, 0);
+        pendingReq_ = std::make_tuple(0, 0, 0);
         promise_ = std::move(cachingPromise_);
         cachingPromise_ = folly::SharedPromise<cpp2::AppendLogResponse>();
         ret = promise_.getFuture();
@@ -176,42 +179,46 @@ void Host::setResponse(const cpp2::AppendLogResponse& r) {
     promise_.setValue(r);
     cachingPromise_.setValue(r);
     cachingPromise_ = folly::SharedPromise<cpp2::AppendLogResponse>();
-    pendingReq_ = std::make_tuple(0, 0, 0, 0, 0);
+    pendingReq_ = std::make_tuple(0, 0, 0);
     requestOnGoing_ = false;
 }
 
-
 void Host::appendLogsInternal(folly::EventBase* eb,
                               std::shared_ptr<cpp2::AppendLogRequest> req) {
-    sendAppendLogRequest(eb, std::move(req)).then(
+    sendAppendLogRequest(eb, std::move(req)).via(eb).then(
             [eb, self = shared_from_this()] (folly::Try<cpp2::AppendLogResponse>&& t) {
         VLOG(3) << self->idStr_ << "appendLogs() call got response";
         if (t.hasException()) {
-            LOG(ERROR) << self->idStr_ << t.exception().what();
+            VLOG(2) << self->idStr_ << t.exception().what();
             cpp2::AppendLogResponse r;
             r.set_error_code(cpp2::ErrorCode::E_EXCEPTION);
             {
                 std::lock_guard<std::mutex> g(self->lock_);
                 self->setResponse(r);
+                self->lastLogIdSent_ = self->logIdToSend_ - 1;
             }
             self->noMoreRequestCV_.notify_all();
-            return r;
+            return;
         }
 
         cpp2::AppendLogResponse resp = std::move(t).value();
-        VLOG(3) << self->idStr_ << "AppendLogResponse "
+        if (FLAGS_trace_raft) {
+            LOG(INFO)
+                << self->idStr_ << "AppendLogResponse "
                 << "code " << static_cast<int32_t>(resp.get_error_code())
                 << ", currTerm " << resp.get_current_term()
                 << ", lastLogId " << resp.get_last_log_id()
                 << ", lastLogTerm " << resp.get_last_log_term()
-                << ", commitLogId " << resp.get_committed_log_id();
+                << ", commitLogId " << resp.get_committed_log_id()
+                << ", lastLogIdSent_ " << self->lastLogIdSent_
+                << ", lastLogTermSent_ " << self->lastLogTermSent_;
+        }
         switch (resp.get_error_code()) {
             case cpp2::ErrorCode::SUCCEEDED: {
                 VLOG(2) << self->idStr_
                         << "AppendLog request sent successfully";
 
                 std::shared_ptr<cpp2::AppendLogRequest> newReq;
-                cpp2::AppendLogResponse r;
                 {
                     std::lock_guard<std::mutex> g(self->lock_);
                     auto res = self->checkStatus();
@@ -219,11 +226,21 @@ void Host::appendLogsInternal(folly::EventBase* eb,
                         VLOG(2) << self->idStr_
                                 << "The host is not in a proper status,"
                                    " just return";
+                        cpp2::AppendLogResponse r;
+                        r.set_error_code(res);
+                        self->setResponse(r);
+                    } else if (self->lastLogIdSent_ >= resp.get_last_log_id()) {
+                        VLOG(1) << self->idStr_
+                                << "We send nothing in the last request"
+                                << ", so we don't send the same logs again";
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
+                        cpp2::AppendLogResponse r;
                         r.set_error_code(res);
                         self->setResponse(r);
                     } else {
                         self->lastLogIdSent_ = resp.get_last_log_id();
                         self->lastLogTermSent_ = resp.get_last_log_term();
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
                         if (self->lastLogIdSent_ < self->logIdToSend_) {
                             // More to send
                             VLOG(2) << self->idStr_
@@ -239,36 +256,34 @@ void Host::appendLogsInternal(folly::EventBase* eb,
                                 VLOG(2) << self->idStr_ << "No request any more!";
                                 self->requestOnGoing_ = false;
                             } else {
-                                VLOG(2) << self->idStr_
-                                        << "Sending the pending request in the queue";
                                 auto& tup = self->pendingReq_;
                                 self->logTermToSend_ = std::get<0>(tup);
                                 self->logIdToSend_ = std::get<1>(tup);
                                 self->committedLogId_ = std::get<2>(tup);
+                                VLOG(2) << self->idStr_
+                                        << "Sending the pending request in the queue"
+                                        << ", from " << self->lastLogIdSent_ + 1
+                                        << " to " << self->logIdToSend_;
                                 newReq = self->prepareAppendLogRequest();
                                 self->promise_ = std::move(self->cachingPromise_);
                                 self->cachingPromise_
                                     = folly::SharedPromise<cpp2::AppendLogResponse>();
-                                self->pendingReq_ = std::make_tuple(0, 0, 0, 0, 0);
-                            }
-                        }
-
-                        r = std::move(resp);
-                    }
+                                self->pendingReq_ = std::make_tuple(0, 0, 0);
+                            }  // self->noRequest()
+                        }  // self->lastLogIdSent_ < self->logIdToSend_
+                    }  // else
                 }
-
                 if (newReq) {
                     self->appendLogsInternal(eb, newReq);
                 } else {
                     self->noMoreRequestCV_.notify_all();
                 }
-                return r;
+                return;
             }
             case cpp2::ErrorCode::E_LOG_GAP: {
                 VLOG(2) << self->idStr_
                         << "The host's log is behind, need to catch up";
                 std::shared_ptr<cpp2::AppendLogRequest> newReq;
-                cpp2::AppendLogResponse r;
                 {
                     std::lock_guard<std::mutex> g(self->lock_);
                     auto res = self->checkStatus();
@@ -276,13 +291,25 @@ void Host::appendLogsInternal(folly::EventBase* eb,
                         VLOG(2) << self->idStr_
                                 << "The host is not in a proper status,"
                                    " skip catching up the gap";
+                        cpp2::AppendLogResponse r;
                         r.set_error_code(res);
                         self->setResponse(r);
-                    } else {
+                    } else if (self->lastLogIdSent_ == resp.get_last_log_id()) {
+                        VLOG(1) << self->idStr_
+                                << "We send nothing in the last request"
+                                << ", so we don't send the same logs again";
                         self->lastLogIdSent_ = resp.get_last_log_id();
                         self->lastLogTermSent_ = resp.get_last_log_term();
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
+                        cpp2::AppendLogResponse r;
+                        r.set_error_code(cpp2::ErrorCode::SUCCEEDED);
+                        self->setResponse(r);
+                    } else {
+                        self->lastLogIdSent_ = std::min(resp.get_last_log_id(),
+                                                        self->logIdToSend_ - 1);
+                        self->lastLogTermSent_ = resp.get_last_log_term();
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
                         newReq = self->prepareAppendLogRequest();
-                        r = std::move(resp);
                     }
                 }
                 if (newReq) {
@@ -290,19 +317,88 @@ void Host::appendLogsInternal(folly::EventBase* eb,
                 } else {
                     self->noMoreRequestCV_.notify_all();
                 }
-                return r;
+                return;
+            }
+            case cpp2::ErrorCode::E_WAITING_SNAPSHOT: {
+                LOG(INFO) << self->idStr_
+                          << "The host is waiting for the snapshot, so we need to send log from "
+                          << " current committedLogId " << self->committedLogId_;
+                std::shared_ptr<cpp2::AppendLogRequest> newReq;
+                {
+                    std::lock_guard<std::mutex> g(self->lock_);
+                    auto res = self->checkStatus();
+                    if (res != cpp2::ErrorCode::SUCCEEDED) {
+                        VLOG(2) << self->idStr_
+                                << "The host is not in a proper status,"
+                                   " skip waiting the snapshot";
+                        cpp2::AppendLogResponse r;
+                        r.set_error_code(res);
+                        self->setResponse(r);
+                    } else {
+                        self->lastLogIdSent_ = self->committedLogId_;
+                        self->lastLogTermSent_ = self->logTermToSend_;
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
+                        newReq = self->prepareAppendLogRequest();
+                    }
+                }
+                if (newReq) {
+                    self->appendLogsInternal(eb, newReq);
+                } else {
+                    self->noMoreRequestCV_.notify_all();
+                }
+                return;
+            }
+            case cpp2::ErrorCode::E_LOG_STALE: {
+                VLOG(2) << self->idStr_ << "Log stale, reset lastLogIdSent " << self->lastLogIdSent_
+                        << " to the followers lastLodId " << resp.get_last_log_id();
+                std::shared_ptr<cpp2::AppendLogRequest> newReq;
+                {
+                    std::lock_guard<std::mutex> g(self->lock_);
+                    auto res = self->checkStatus();
+                    if (res != cpp2::ErrorCode::SUCCEEDED) {
+                        VLOG(2) << self->idStr_
+                                << "The host is not in a proper status,"
+                                   " skip waiting the snapshot";
+                        cpp2::AppendLogResponse r;
+                        r.set_error_code(res);
+                        self->setResponse(r);
+                    } else if (self->logIdToSend_ <= resp.get_last_log_id()) {
+                        VLOG(1) << self->idStr_
+                                << "It means the request has been received by follower";
+                        self->lastLogIdSent_ = self->logIdToSend_ - 1;
+                        self->lastLogTermSent_ = resp.get_last_log_term();
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
+                        cpp2::AppendLogResponse r;
+                        r.set_error_code(cpp2::ErrorCode::SUCCEEDED);
+                        self->setResponse(r);
+                    } else {
+                        self->lastLogIdSent_ = std::min(resp.get_last_log_id(),
+                                                        self->logIdToSend_ - 1);
+                        self->lastLogTermSent_ = resp.get_last_log_term();
+                        self->followerCommittedLogId_ = resp.get_committed_log_id();
+                        newReq = self->prepareAppendLogRequest();
+                    }
+                }
+                if (newReq) {
+                    self->appendLogsInternal(eb, newReq);
+                } else {
+                    self->noMoreRequestCV_.notify_all();
+                }
+                return;
             }
             default: {
-                LOG(ERROR) << self->idStr_
+                LOG_EVERY_N(ERROR, 100)
+                           << self->idStr_
                            << "Failed to append logs to the host (Err: "
                            << static_cast<int32_t>(resp.get_error_code())
                            << ")";
                 {
                     std::lock_guard<std::mutex> g(self->lock_);
                     self->setResponse(resp);
+                    self->lastLogIdSent_ = self->logIdToSend_ - 1;
                 }
                 self->noMoreRequestCV_.notify_all();
-                return resp;
+                return;
             }
         }
     });
@@ -310,13 +406,13 @@ void Host::appendLogsInternal(folly::EventBase* eb,
 
 
 std::shared_ptr<cpp2::AppendLogRequest>
-Host::prepareAppendLogRequest() const {
+Host::prepareAppendLogRequest() {
     CHECK(!lock_.try_lock());
     auto req = std::make_shared<cpp2::AppendLogRequest>();
     req->set_space(part_->spaceId());
     req->set_part(part_->partitionId());
     req->set_current_term(logTermToSend_);
-    // req->set_last_log_id(logIdToSend_);
+    req->set_last_log_id(logIdToSend_);
     req->set_leader_ip(part_->address().first);
     req->set_leader_port(part_->address().second);
     req->set_committed_log_id(committedLogId_);
@@ -324,7 +420,13 @@ Host::prepareAppendLogRequest() const {
     req->set_last_log_id_sent(lastLogIdSent_);
 
     VLOG(2) << idStr_ << "Prepare AppendLogs request from Log "
-            << lastLogIdSent_ + 1 << " to " << logIdToSend_;
+                      << lastLogIdSent_ + 1 << " to " << logIdToSend_;
+    if (lastLogIdSent_ + 1 > part_->wal()->lastLogId()) {
+        LOG(INFO) << idStr_ << "My lastLogId in wal is " << part_->wal()->lastLogId()
+                  << ", but you are seeking " << lastLogIdSent_ + 1
+                  << ", so i have nothing to send.";
+        return req;
+    }
     auto it = part_->wal()->iterator(lastLogIdSent_ + 1, logIdToSend_);
     if (it->valid()) {
         VLOG(2) << idStr_ << "Prepare the list of log entries to send";
@@ -344,8 +446,30 @@ Host::prepareAppendLogRequest() const {
             logs.emplace_back(std::move(le));
         }
         req->set_log_str_list(std::move(logs));
+        req->set_sending_snapshot(false);
     } else {
-        req->set_log_term(0);
+        req->set_sending_snapshot(true);
+        if (!sendingSnapshot_) {
+            LOG(INFO) << idStr_ << "Can't find log " << lastLogIdSent_ + 1
+                      << " in wal, send the snapshot"
+                      << ", logIdToSend = " << logIdToSend_
+                      << ", firstLogId in wal = " << part_->wal()->firstLogId()
+                      << ", lastLogId in wal = " << part_->wal()->lastLogId();
+            sendingSnapshot_ = true;
+            part_->snapshot_->sendSnapshot(part_, addr_)
+                .thenValue([self = shared_from_this()] (Status&& status) {
+                if (status.ok()) {
+                    LOG(INFO) << self->idStr_ << "Send snapshot succeeded!";
+                } else {
+                    LOG(INFO) << self->idStr_ << "Send snapshot failed!";
+                    // TODO(heng): we should tell the follower i am failed.
+                }
+                self->sendingSnapshot_ = false;
+            });
+        } else {
+            LOG_EVERY_N(INFO, 30) << idStr_
+                                   << "The snapshot req is in queue, please wait for a moment";
+        }
     }
 
     return req;
@@ -361,8 +485,8 @@ folly::Future<cpp2::AppendLogResponse> Host::sendAppendLogRequest(
         std::lock_guard<std::mutex> g(lock_);
         auto res = checkStatus();
         if (res != cpp2::ErrorCode::SUCCEEDED) {
-            VLOG(2) << idStr_
-                    << "The Host is not in a proper status, do not send";
+            LOG(WARNING) << idStr_
+                         << "The Host is not in a proper status, do not send";
             cpp2::AppendLogResponse resp;
             resp.set_error_code(res);
             return resp;
@@ -372,18 +496,18 @@ folly::Future<cpp2::AppendLogResponse> Host::sendAppendLogRequest(
     VLOG(1) << idStr_ << "Sending request space " << req->get_space()
               << ", part " << req->get_part()
               << ", current term " << req->get_current_term()
-              << ", last_log_id" << req->get_last_log_id()
+              << ", last_log_id " << req->get_last_log_id()
               << ", committed_id " << req->get_committed_log_id()
               << ", last_log_term_sent" << req->get_last_log_term_sent()
               << ", last_log_id_sent " << req->get_last_log_id_sent();
     // Get client connection
-    auto client = tcManager().client(addr_, eb);
+    auto client = tcManager().client(addr_, eb, false, FLAGS_raft_rpc_timeout_ms);
     return client->future_appendLog(*req);
 }
 
 bool Host::noRequest() const {
     CHECK(!lock_.try_lock());
-    static auto emptyTup = std::make_tuple(0, 0, 0, 0, 0);
+    static auto emptyTup = std::make_tuple(0, 0, 0);
     return pendingReq_ == emptyTup;
 }
 

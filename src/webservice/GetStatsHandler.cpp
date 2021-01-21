@@ -49,7 +49,8 @@ void GetStatsHandler::onEOM() noexcept {
     switch (err_) {
         case HttpCode::E_UNSUPPORTED_METHOD:
             ResponseBuilder(downstream_)
-                .status(405, "Method Not Allowed")
+                .status(WebServiceUtils::to(HttpStatusCode::METHOD_NOT_ALLOWED),
+                        WebServiceUtils::toString(HttpStatusCode::METHOD_NOT_ALLOWED))
                 .sendWithEOM();
             return;
         default:
@@ -60,12 +61,14 @@ void GetStatsHandler::onEOM() noexcept {
     folly::dynamic vals = getStats();
     if (returnJson_) {
         ResponseBuilder(downstream_)
-            .status(200, "OK")
+            .status(WebServiceUtils::to(HttpStatusCode::OK),
+                    WebServiceUtils::toString(HttpStatusCode::OK))
             .body(folly::toJson(vals))
             .sendWithEOM();
     } else {
         ResponseBuilder(downstream_)
-            .status(200, "OK")
+            .status(WebServiceUtils::to(HttpStatusCode::OK),
+                    WebServiceUtils::toString(HttpStatusCode::OK))
             .body(toStr(vals))
             .sendWithEOM();
     }
@@ -99,6 +102,16 @@ void GetStatsHandler::addOneStat(folly::dynamic& vals,
 }
 
 
+void GetStatsHandler::addOneStat(folly::dynamic& vals,
+                                 const std::string& statName,
+                                 const std::string& error) const {
+    folly::dynamic stat = folly::dynamic::object();
+    stat["name"] = statName;
+    stat["value"] = error;
+    vals.push_back(std::move(stat));
+}
+
+
 folly::dynamic GetStatsHandler::getStats() const {
     auto stats = folly::dynamic::array();
     if (statNames_.empty()) {
@@ -106,8 +119,13 @@ folly::dynamic GetStatsHandler::getStats() const {
         StatsManager::readAllValue(stats);
     } else {
         for (auto& sn : statNames_) {
-            int64_t statValue = StatsManager::readValue(sn);
-            addOneStat(stats, sn, statValue);
+            auto status = StatsManager::readValue(sn);
+            if (status.ok()) {
+                int64_t statValue = status.value();
+                addOneStat(stats, sn, statValue);
+            } else {
+                addOneStat(stats, sn, status.status().toString());
+            }
         }
     }
 

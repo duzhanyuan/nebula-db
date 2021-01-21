@@ -81,30 +81,31 @@ void CmdProcessor::calColumnWidths(
                     break;
                 }
                 case cpp2::ColumnValue::Type::id: {
-                    // Enough to hold "0x{16 letters}"
-                    if (widths[idx] < 18UL) {
-                        widths[idx] = 18UL;
-                        genFmt = true;
-                    }
+                    GET_VALUE_WIDTH(int64_t, id, "%ld");
+
                     if (genFmt) {
-                        formats[idx] =
-                            folly::stringPrintf(" %%-%ldLX |", widths[idx]);
+                        formats[idx] = folly::stringPrintf(" %%-%ldld |", widths[idx]);
                     }
                     break;
                 }
                 case cpp2::ColumnValue::Type::single_precision: {
-                    GET_VALUE_WIDTH(float, single_precision, "%f")
+                    int digits10 = std::numeric_limits<float>::digits10;
+                    std::string fmtValue = folly::sformat("%.{}f", digits10);
+                    GET_VALUE_WIDTH(float, single_precision, fmtValue.c_str());
                     if (genFmt) {
-                        formats[idx] =
-                            folly::stringPrintf(" %%-%ldf |", widths[idx]);
+                        std::string fmt = folly::sformat(" %%-%ld.{}f |", digits10);
+                        formats[idx] = folly::stringPrintf(fmt.c_str(), widths[idx]);
                     }
                     break;
                 }
                 case cpp2::ColumnValue::Type::double_precision: {
-                    GET_VALUE_WIDTH(double, double_precision, "%lf")
+                    int digits10 = std::numeric_limits<double>::digits10;
+                    auto str = folly::sformat("%.{}lf", digits10);
+                    const char *fmtValue = str.c_str();
+                    GET_VALUE_WIDTH(double, double_precision, fmtValue);
                     if (genFmt) {
-                        formats[idx] =
-                            folly::stringPrintf(" %%-%ldlf |", widths[idx]);
+                        std::string fmt = folly::sformat(" %%-%ld.{}lf |", digits10);
+                        formats[idx] = folly::stringPrintf(fmt.c_str(), widths[idx]);
                     }
                     break;
                 }
@@ -121,10 +122,15 @@ void CmdProcessor::calColumnWidths(
                     break;
                 }
                 case cpp2::ColumnValue::Type::timestamp: {
-                    GET_VALUE_WIDTH(int64_t, timestamp, "%ld")
+                    if (widths[idx] < 19) {
+                        widths[idx] = 19;
+                        genFmt = true;
+                    }
                     if (genFmt) {
                         formats[idx] =
-                            folly::stringPrintf(" %%-%ldld |", widths[idx]);
+                            folly::stringPrintf(" %%%ldd-%%02d-%%02d"
+                                                " %%02d:%%02d:%%02d |",
+                                                widths[idx] - 15);
                     }
                     break;
                 }
@@ -172,6 +178,46 @@ void CmdProcessor::calColumnWidths(
                                                 " %%02d:%%02d:%%02d"
                                                 ".%%03d%%03d |",
                                                 widths[idx] - 22);
+                    }
+                    break;
+                }
+                case cpp2::ColumnValue::Type::path: {
+                    auto pathValue = col.get_path();
+                    auto entryList = pathValue.get_entry_list();
+                    decltype(entryList.size()) entryIdx = 0;
+                    formats.resize(entryList.size(), "");
+                    widths.resize(entryList.size(), 0);
+                    for (auto &entry : entryList) {
+                        if (entry.getType() ==  cpp2::PathEntry::vertex) {
+                            auto v = entry.get_vertex();
+                            auto id = v.get_id();
+                            size_t idLen = folly::stringPrintf("%ld", id).size();
+                            if (widths[entryIdx] < idLen) {
+                                widths[entryIdx] = idLen;
+                                genFmt = true;
+                            }
+                            if (genFmt) {
+                                formats[entryIdx] =
+                                        folly::stringPrintf(" %%%ldld", idLen);
+                            }
+                        }
+                        if (entry.getType() == cpp2::PathEntry::edge) {
+                            auto e = entry.get_edge();
+                            auto type = e.get_type();
+                            auto ranking = e.get_ranking();
+                            size_t typeLen = folly::stringPrintf("%s", type.c_str()).size();
+                            size_t rankingLen = folly::stringPrintf("%ld", ranking).size();
+                            size_t len = typeLen + rankingLen + 4;
+                            if (widths[entryIdx] < len) {
+                                widths[entryIdx] = len;
+                                genFmt = true;
+                            }
+                            if (genFmt) {
+                                formats[entryIdx] =
+                                    folly::stringPrintf(" <%%%lds,%%%ldld>", typeLen, rankingLen);
+                            }
+                        }
+                        ++entryIdx;
                     }
                     break;
                 }
@@ -272,7 +318,22 @@ void CmdProcessor::printData(const cpp2::ExecutionResponse& resp,
                     break;
                 }
                 case cpp2::ColumnValue::Type::timestamp: {
-                    PRINT_FIELD_VALUE(col.get_timestamp());
+                    time_t timestamp = col.get_timestamp();
+                    struct tm time;
+                    if (nullptr == localtime_r(&timestamp, &time)) {
+                        time.tm_year = 1970;
+                        time.tm_mon = 1;
+                        time.tm_mday = 1;
+                        time.tm_hour = 0;
+                        time.tm_min = 0;
+                        time.tm_sec = 0;
+                    }
+                    PRINT_FIELD_VALUE(time.tm_year + 1900,
+                                      time.tm_mon + 1,
+                                      time.tm_mday,
+                                      time.tm_hour,
+                                      time.tm_min,
+                                      time.tm_sec);
                     break;
                 }
                 case cpp2::ColumnValue::Type::year: {
@@ -301,6 +362,22 @@ void CmdProcessor::printData(const cpp2::ExecutionResponse& resp,
                                       dt.get_microsec());
                     break;
                 }
+                case cpp2::ColumnValue::Type::path: {
+                    auto pathValue = col.get_path();
+                    auto entryList = pathValue.get_entry_list();
+                    cIdx = 0;
+                    for (auto &entry : entryList) {
+                        if (entry.getType() == cpp2::PathEntry::vertex) {
+                            PRINT_FIELD_VALUE(entry.get_vertex().get_id());
+                        }
+                        if (entry.getType() == cpp2::PathEntry::edge) {
+                            auto e = entry.get_edge();
+                            PRINT_FIELD_VALUE(e.get_type().c_str(), e.get_ranking());
+                        }
+                        ++cIdx;
+                    }
+                    break;
+                }
             }
             ++cIdx;
         }
@@ -308,6 +385,12 @@ void CmdProcessor::printData(const cpp2::ExecutionResponse& resp,
     }
 }
 #undef PRINT_FIELD_VALUE
+
+void CmdProcessor::printTime() const {
+    auto now = std::chrono::system_clock::now();
+    std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
+    std::cout << std::ctime(&nowTime) << std::endl;
+}
 
 
 bool CmdProcessor::processClientCmd(folly::StringPiece cmd,
@@ -335,43 +418,37 @@ void CmdProcessor::processServerCmd(folly::StringPiece cmd) {
         auto *spaceName = resp.get_space_name();
         if (spaceName && !spaceName->empty()) {
             curSpaceName_ = std::move(*spaceName);
-        }
-        printResult(resp);
-        if (resp.get_rows() != nullptr) {
-            std::cout << "Got " << resp.get_rows()->size()
-                      << " rows (Time spent: "
-                      << resp.get_latency_in_us() << "/"
-                      << dur.elapsedInUSec() << " us)\n";
         } else {
-            std::cout << "Execution succeeded (Time spent: "
-                      << resp.get_latency_in_us() << "/"
+            curSpaceName_ = "(none)";
+        }
+        if (resp.get_rows() && !resp.get_rows()->empty()) {
+            printResult(resp);
+            std::cout << "Got " << resp.get_rows()->size()
+                      << " rows (Time spent: ";
+        } else if (resp.get_rows()) {
+            std::cout << "Empty set (Time spent: ";
+        } else {
+            std::cout << "Execution succeeded (Time spent: ";
+        }
+        if (resp.get_latency_in_us() < 1000 || dur.elapsedInUSec() < 1000) {
+            std::cout << resp.get_latency_in_us() << "/"
                       << dur.elapsedInUSec() << " us)\n";
+        } else if (resp.get_latency_in_us() < 1000000 || dur.elapsedInUSec() < 1000000) {
+            std::cout << resp.get_latency_in_us() / 1000.0 << "/"
+                      << dur.elapsedInUSec() / 1000.0 << " ms)\n";
+        } else {
+            std::cout << resp.get_latency_in_us() / 1000000.0 << "/"
+                      << dur.elapsedInUSec() / 1000000.0 << " s)\n";
         }
         std::cout << std::endl;
-    } else if (res == cpp2::ErrorCode::E_SYNTAX_ERROR) {
-        static const std::regex range("at 1.([0-9]+)-([0-9]+)");
-        static const std::regex single("at 1.([0-9]+)");
-        std::smatch result;
-        auto *msg = resp.get_error_msg();
-        auto verbose = *msg;
-        std::string headMsg = "syntax error near `";
-        auto pos = msg->find("at 1.");
-        if (pos != msg->npos) {
-            headMsg = msg->substr(0, pos) + "near `";
-            headMsg.replace(headMsg.find("SyntaxError:"), sizeof("SyntaxError:"), "");
+
+        if (resp.__isset.warning_msg) {
+            std::cout << "[WARNING]: " << *resp.get_warning_msg() << std::endl;
+            std::cout << std::endl;
         }
-        if (std::regex_search(*msg, result, range)) {
-            auto start = folly::to<size_t>(result[1].str());
-            auto end = folly::to<size_t>(result[2].str());
-            verbose = headMsg + std::string(&cmd[start-1], end - start + 1) + "'";
-        } else if (std::regex_search(*msg, result, single)) {
-            auto start = folly::to<size_t>(result[1].str());
-            auto end = start + 8;
-            end = end > cmd.size() ? cmd.size() : end;
-            verbose = headMsg + std::string(&cmd[start-1], end - start + 1) + "'";
-        }
-        std::cout << "[ERROR (" << static_cast<int32_t>(res)
-                  << ")]: " << verbose << "\n";
+   } else if (res == cpp2::ErrorCode::E_SYNTAX_ERROR) {
+        std::cout << "[ERROR (" << static_cast<int32_t>(res) << ")]: "
+                  << (resp.get_error_msg() == nullptr ? "" : *resp.get_error_msg()) << "\n";
     } else if (res == cpp2::ErrorCode::E_STATEMENT_EMTPY) {
         return;
     } else {
@@ -385,6 +462,9 @@ void CmdProcessor::processServerCmd(folly::StringPiece cmd) {
 
 
 bool CmdProcessor::process(folly::StringPiece cmd) {
+    SCOPE_EXIT {
+        printTime();
+    };
     bool exit;
     if (processClientCmd(cmd, exit)) {
         return !exit;
@@ -410,4 +490,3 @@ const std::string& CmdProcessor::getSpaceName() const {
 
 }  // namespace graph
 }  // namespace nebula
-

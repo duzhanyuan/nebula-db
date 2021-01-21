@@ -5,7 +5,7 @@
  */
 
 #include "base/Base.h"
-#include "base/NebulaKeyUtils.h"
+#include "utils/NebulaKeyUtils.h"
 #include "dataman/RowReader.h"
 #include "dataman/RowWriter.h"
 #include "kvstore/plugins/hbase/HBaseStore.h"
@@ -77,8 +77,8 @@ TEST(HBaseStoreTest, SimpleTest) {
     });
 
     std::vector<std::string> retEdgeValues;
-    EXPECT_EQ(ResultCode::SUCCEEDED,
-              hbaseStore->multiGet(spaceId, partId, edgeKeys, &retEdgeValues));
+    auto ret = hbaseStore->multiGet(spaceId, partId, edgeKeys, &retEdgeValues);
+    EXPECT_EQ(ResultCode::SUCCEEDED, ret.first);
     EXPECT_EQ(20, retEdgeValues.size());
 
     auto checkPrefix = [&](const std::string& prefix,
@@ -100,9 +100,9 @@ TEST(HBaseStoreTest, SimpleTest) {
         }
         EXPECT_EQ(expectedTotal, num);
     };
-    std::string prefix1 = NebulaKeyUtils::prefix(partId, srcId);
+    std::string prefix1 = NebulaKeyUtils::vertexPrefix(partId, srcId);
     checkPrefix(prefix1, 0, 20);
-    std::string prefix2 = NebulaKeyUtils::prefix(partId, srcId, edgeType);
+    std::string prefix2 = NebulaKeyUtils::edgePrefix(partId, srcId, edgeType);
     checkPrefix(prefix2, 0, 10);
     std::string prefix3 = NebulaKeyUtils::prefix(partId, srcId, edgeType + 1, rank, dstId);
     checkPrefix(prefix3, 10, 10);
@@ -116,8 +116,8 @@ TEST(HBaseStoreTest, SimpleTest) {
     });
 
     retEdgeValues.clear();
-    EXPECT_EQ(ResultCode::ERR_UNKNOWN,
-              hbaseStore->multiGet(spaceId, partId, edgeKeys, &retEdgeValues));
+    ret = hbaseStore->multiGet(spaceId, partId, edgeKeys, &retEdgeValues);
+    EXPECT_EQ(ResultCode::ERR_UNKNOWN, ret.first);
     EXPECT_EQ(0, retEdgeValues.size());
 }
 

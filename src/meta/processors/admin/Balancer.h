@@ -18,6 +18,9 @@
 
 namespace nebula {
 namespace meta {
+
+using LeaderBalancePlan = std::vector<std::tuple<GraphSpaceID, PartitionID, HostAddr, HostAddr>>;
+
 /**
 There are two interfaces public:
  * Balance:  it will construct a balance plan and invoked it. If last balance plan is not succeeded, it will
@@ -40,11 +43,23 @@ Some notes:
 class Balancer {
     FRIEND_TEST(BalanceTest, BalancePartsTest);
     FRIEND_TEST(BalanceTest, NormalTest);
+    FRIEND_TEST(BalanceTest, SpecifyHostTest);
+    FRIEND_TEST(BalanceTest, SpecifyMultiHostTest);
+    FRIEND_TEST(BalanceTest, MockReplaceMachineTest);
+    FRIEND_TEST(BalanceTest, SingleReplicaTest);
     FRIEND_TEST(BalanceTest, RecoveryTest);
+    FRIEND_TEST(BalanceTest, StopBalanceDataTest);
+    FRIEND_TEST(BalanceTest, LeaderBalancePlanTest);
+    FRIEND_TEST(BalanceTest, SimpleLeaderBalancePlanTest);
+    FRIEND_TEST(BalanceTest, IntersectHostsLeaderBalancePlanTest);
+    FRIEND_TEST(BalanceTest, LeaderBalanceTest);
+    FRIEND_TEST(BalanceTest, ManyHostsLeaderBalancePlanTest);
+    FRIEND_TEST(BalanceIntegrationTest, LeaderBalanceTest);
+    FRIEND_TEST(BalanceIntegrationTest, BalanceTest);
 
 public:
     static Balancer* instance(kvstore::KVStore* kv) {
-        static std::unique_ptr<AdminClient> client(new AdminClient());
+        static std::unique_ptr<AdminClient> client(new AdminClient(kv));
         static std::unique_ptr<Balancer> balancer(new Balancer(kv, std::move(client)));
         return balancer.get();
     }
@@ -54,20 +69,23 @@ public:
     /*
      * Return Error if reject the balance request, otherwise return balance id.
      * */
-    StatusOr<BalanceID> balance();
+    ErrorOr<cpp2::ErrorCode, BalanceID> balance(std::unordered_set<HostAddr> hostDel = {});
 
     /**
-     * TODO(heng): Rollback some specific balance id
+     * Show balance plan id status.
+     * */
+    StatusOr<BalancePlan> show(BalanceID id) const;
+
+    /**
+     * Stop balance plan by canceling all waiting balance task.
+     * */
+    StatusOr<BalanceID> stop();
+
+    /**
+     * TODO(heng): rollback some balance plan.
      */
     Status rollback(BalanceID id) {
         return Status::Error("unplemented, %ld", id);
-    }
-
-    /**
-     * TODO(heng): Only generate balance plan for our users.
-     * */
-    const BalancePlan* preview() {
-        return plan_.get();
     }
 
     /**
@@ -86,6 +104,19 @@ public:
         return Status::Error("Unsupport it yet!");
     }
 
+    cpp2::ErrorCode leaderBalance();
+
+    void finish() {
+        CHECK(!lock_.try_lock());
+        plan_.reset();
+        running_ = false;
+    }
+
+    bool isRunning() {
+        std::lock_guard<std::mutex> lg(lock_);
+        return running_;
+    }
+
 private:
     Balancer(kvstore::KVStore* kv, std::unique_ptr<AdminClient> client)
         : kv_(kv)
@@ -95,14 +126,15 @@ private:
     /*
      * When the balancer failover, we should recovery the status.
      * */
-    bool recovery();
+    cpp2::ErrorCode recovery();
 
     /**
      * Build balance plan and save it in kvstore.
      * */
-    Status buildBalancePlan();
+    cpp2::ErrorCode buildBalancePlan(std::unordered_set<HostAddr> hostDel);
 
-    std::vector<BalanceTask> genTasks(GraphSpaceID spaceId);
+    ErrorOr<cpp2::ErrorCode, std::vector<BalanceTask>>
+    genTasks(GraphSpaceID spaceId, int32_t spaceReplica, std::unordered_set<HostAddr> hostDel);
 
     void getHostParts(GraphSpaceID spaceId,
                       std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts,
@@ -111,7 +143,12 @@ private:
     void calDiff(const std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts,
                  const std::vector<HostAddr>& activeHosts,
                  std::vector<HostAddr>& newlyAdded,
-                 std::vector<HostAddr>& lost);
+                 std::unordered_set<HostAddr>& lost);
+
+    Status checkReplica(const std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts,
+                        const std::vector<HostAddr>& activeHosts,
+                        int32_t replica,
+                        PartitionID partId);
 
     StatusOr<HostAddr> hostWithMinimalParts(
                         const std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts,
@@ -127,13 +164,42 @@ private:
     std::vector<std::pair<HostAddr, int32_t>>
     sortedHostsByParts(const std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts);
 
+    bool getAllSpaces(std::vector<std::pair<GraphSpaceID, int32_t>>& spaces,
+                      kvstore::ResultCode& retCode);
+
+    std::unordered_map<HostAddr, std::vector<PartitionID>>
+    buildLeaderBalancePlan(HostLeaderMap* hostLeaderMap, GraphSpaceID spaceId,
+                           LeaderBalancePlan& plan, bool useDeviation = true);
+
+    void simplifyLeaderBalnacePlan(GraphSpaceID spaceId, LeaderBalancePlan& plan);
+
+    int32_t acquireLeaders(std::unordered_map<HostAddr, std::vector<PartitionID>>& allHostParts,
+                           std::unordered_map<HostAddr, std::vector<PartitionID>>& leaderHostParts,
+                           std::unordered_map<PartitionID, std::vector<HostAddr>>& peersMap,
+                           std::unordered_set<HostAddr>& activeHosts,
+                           HostAddr to,
+                           size_t maxLoad,
+                           LeaderBalancePlan& plan,
+                           GraphSpaceID spaceId);
+
+    int32_t giveupLeaders(std::unordered_map<HostAddr, std::vector<PartitionID>>& leaderHostParts,
+                          std::unordered_map<PartitionID, std::vector<HostAddr>>& peersMap,
+                          std::unordered_set<HostAddr>& activeHosts,
+                          HostAddr from,
+                          size_t maxLoad,
+                          LeaderBalancePlan& plan,
+                          GraphSpaceID spaceId);
+
 private:
-    std::atomic_bool  running_{false};
+    std::atomic_bool running_{false};
     kvstore::KVStore* kv_ = nullptr;
     std::unique_ptr<AdminClient> client_{nullptr};
     // Current running plan.
-    std::unique_ptr<BalancePlan> plan_{nullptr};
+    std::shared_ptr<BalancePlan> plan_{nullptr};
     std::unique_ptr<folly::Executor> executor_;
+    std::atomic_bool inLeaderBalance_{false};
+    std::unique_ptr<HostLeaderMap> hostLeaderMap_;
+    mutable std::mutex lock_;
 };
 
 }  // namespace meta

@@ -8,12 +8,9 @@
 #include "meta/processors/admin/HBProcessor.h"
 #include "time/WallClock.h"
 #include "meta/ActiveHostsMan.h"
+#include "meta/ClusterIdMan.h"
 
-DEFINE_int32(expired_hosts_check_interval_sec, 20,
-             "Check the expired hosts at the interval");
-DEFINE_int32(expired_threshold_sec, 10 * 60,
-             "Hosts will be expired in this time if no heartbeat received");
-DEFINE_bool(hosts_whitelist_enabled, true, "Check host whether in whitelist when received hb");
+DEFINE_bool(hosts_whitelist_enabled, false, "Check host whether in whitelist when received hb");
 
 namespace nebula {
 namespace meta {
@@ -24,17 +21,41 @@ void HBProcessor::process(const cpp2::HBReq& req) {
             && hostExist(MetaServiceUtils::hostKey(host.first, host.second))
                 == Status::HostNotFound()) {
         LOG(INFO) << "Reject unregistered host " << host << "!";
-        resp_.set_code(cpp2::ErrorCode::E_INVALID_HOST);
+        handleErrorCode(cpp2::ErrorCode::E_INVALID_HOST);
         onFinished();
         return;
     }
 
-    LOG(INFO) << "Receive heartbeat from " << host;
-    HostInfo info;
-    info.lastHBTimeInSec_ = time::WallClock::fastNowInSec();
-    if (!ActiveHostsMan::instance()->updateHostInfo(host, info)) {
-        resp_.set_code(cpp2::ErrorCode::E_LEADER_CHANGED);
+    auto ret = kvstore::ResultCode::SUCCEEDED;
+    if (req.get_in_storaged()) {
+        LOG(INFO) << "Receive heartbeat from " << host;
+        ClusterID peerCluserId = req.get_cluster_id();
+        if (peerCluserId == 0) {
+            LOG(INFO) << "Set clusterId for new host " << host << "!";
+            resp_.set_cluster_id(clusterId_);
+        } else if (peerCluserId != clusterId_) {
+            LOG(ERROR) << "Reject wrong cluster host " << host << "!";
+            handleErrorCode(cpp2::ErrorCode::E_WRONGCLUSTER);
+            onFinished();
+            return;
+        }
+        HostInfo info(time::WallClock::fastNowInMilliSec());
+        if (req.__isset.leader_partIds) {
+            ret = ActiveHostsMan::updateHostInfo(kvstore_, host, info,
+                                                 req.get_leader_partIds());
+        } else {
+            ret = ActiveHostsMan::updateHostInfo(kvstore_, host, info);
+        }
+        if (ret == kvstore::ResultCode::ERR_LEADER_CHANGED) {
+            auto leaderRet = kvstore_->partLeader(kDefaultSpaceId, kDefaultPartId);
+            if (nebula::ok(leaderRet)) {
+                resp_.set_leader(toThriftHost(nebula::value(leaderRet)));
+            }
+        }
     }
+    handleErrorCode(MetaCommon::to(ret));
+    int64_t lastUpdateTime = LastUpdateTimeMan::get(this->kvstore_);
+    resp_.set_last_update_time_in_ms(lastUpdateTime);
     onFinished();
 }
 

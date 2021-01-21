@@ -1,11 +1,12 @@
 /* Copyright (c) 2018 vesoft inc. All rights reserved.
  *
+ *
  * This source code is licensed under Apache 2.0 License,
  * attached with Common Clause Condition 1.0, found in the LICENSES directory.
  */
 
 #include "base/Base.h"
-#include "base/Cord.h"
+#include "base/ICord.h"
 #include "filter/Expressions.h"
 #include "filter/FunctionManager.h"
 
@@ -21,34 +22,12 @@
 
 namespace nebula {
 
-
-Status ExpressionContext::addAliasProp(const std::string &alias, const std::string &prop) {
-    auto kind = aliasKind(alias);
-    if (kind == AliasKind::Unknown) {
-        return Status::Error("Alias `%s' not defined", alias.c_str());
-    }
-    if (kind == AliasKind::Edge) {
-        addEdgeProp(prop);
-        return Status::OK();
-    }
-    return Status::Error("Illegal alias `%s'", alias.c_str());
-}
-
-
-std::string aliasKindToString(AliasKind kind) {
-    switch (kind) {
-        case AliasKind::Unknown:
-            return "Unknown";
-        case AliasKind::SourceNode:
-            return "SourceNode";
-        case AliasKind::Edge:
-            return "Edge";
-        default:
-            FLOG_FATAL("Illegal AliasKind");
-    }
-    return "Unknown";
-}
-
+namespace {
+constexpr char INPUT_REF[] = "$-";
+constexpr char VAR_REF[] = "$";
+constexpr char SRC_REF[] = "$^";
+constexpr char DST_REF[] = "$$";
+}   // namespace
 
 void Expression::print(const VariantType &value) {
     switch (value.which()) {
@@ -78,6 +57,8 @@ std::unique_ptr<Expression> Expression::makeExpr(uint8_t kind) {
             return std::make_unique<UnaryExpression>();
         case kTypeCasting:
             return std::make_unique<TypeCastingExpression>();
+        case kUUID:
+            return std::make_unique<UUIDExpression>();
         case kArithmetic:
             return std::make_unique<ArithmeticExpression>();
         case kRelational:
@@ -94,8 +75,8 @@ std::unique_ptr<Expression> Expression::makeExpr(uint8_t kind) {
             return std::make_unique<EdgeSrcIdExpression>();
         case kEdgeType:
             return std::make_unique<EdgeTypeExpression>();
-        case kEdgeProp:
-            return std::make_unique<EdgePropertyExpression>();
+        case kAliasProp:
+            return std::make_unique<AliasPropertyExpression>();
         case kVariableProp:
             return std::make_unique<VariablePropertyExpression>();
         case kDestProp:
@@ -110,7 +91,7 @@ std::unique_ptr<Expression> Expression::makeExpr(uint8_t kind) {
 
 // static
 std::string Expression::encode(Expression *expr) noexcept {
-    Cord cord(1024);
+    ICord<> cord;
     expr->encode(cord);
     return cord.str();
 }
@@ -128,195 +109,79 @@ Expression::decode(folly::StringPiece buffer) noexcept {
         if (pos != end) {
             return Status::Error("Buffer not consumed up, end: %p, used upto: %p", end, pos);
         }
-        return std::move(expr);
+        return expr;
     } catch (const Status &status) {
         return status;
     }
 }
 
-
-std::string InputPropertyExpression::toString() const {
+std::string AliasPropertyExpression::toString() const {
     std::string buf;
     buf.reserve(64);
-    buf += "$-.";
-    buf += *prop_;
+    if (ref_ != nullptr) {
+        buf += *ref_;
+    }
+    if (*ref_ != "" && *ref_ != VAR_REF) {
+        buf += ".";
+    }
+    if (alias_ != nullptr) {
+        buf += *alias_;
+    }
+    if (*alias_ != "") {
+        buf += ".";
+    }
+    if (prop_ != nullptr) {
+        buf += *prop_;
+    }
     return buf;
 }
 
-
-VariantType InputPropertyExpression::eval() const {
-    return context_->getters().getInputProp(*prop_);
+OptVariantType AliasPropertyExpression::eval(Getters &getters) const {
+    if (getters.getAliasProp == nullptr) {
+        return Status::Error("`getAliasProp' function is not implemented");
+    }
+    return getters.getAliasProp(*alias_, *prop_);
 }
 
-
-void InputPropertyExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(prop_->size());
-    cord << *prop_;
-}
-
-
-const char* InputPropertyExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 2UL);
-    auto size = *reinterpret_cast<const uint16_t*>(pos);
-    pos += 2;
-
-    THROW_IF_NO_SPACE(pos, end, size);
-    prop_ = std::make_unique<std::string>(pos, size);
-    pos += size;
-
-    return pos;
-}
-
-
-std::string DestPropertyExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += "$$.";
-    buf += *tag_;
-    buf += ".";
-    buf += *prop_;
-    return buf;
-}
-
-
-VariantType DestPropertyExpression::eval() const {
-    return context_->getters().getDstTagProp(*tag_, *prop_);
-}
-
-
-Status DestPropertyExpression::prepare() {
-    context_->addDstTagProp(*tag_, *prop_);
+Status AliasPropertyExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
     return Status::OK();
 }
 
-
-void DestPropertyExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(tag_->size());
-    cord << *tag_;
-    cord << static_cast<uint16_t>(prop_->size());
-    cord << *prop_;
-}
-
-
-const char* DestPropertyExpression::decode(const char *pos, const char *end) {
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
-
-        THROW_IF_NO_SPACE(pos, end, size);
-        tag_ = std::make_unique<std::string>(pos, size);
-        pos += size;
-    }
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
-
-        THROW_IF_NO_SPACE(pos, end, size);
-        prop_ = std::make_unique<std::string>(pos, size);
-        pos += size;
-    }
-
-    return pos;
-}
-
-
-std::string VariablePropertyExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += "$";
-    buf += *var_;
-    buf += ".";
-    buf += *prop_;
-    return buf;
-}
-
-
-VariantType VariablePropertyExpression::eval() const {
-    // TODO(dutor)
-    return toString();
-}
-
-
-Status VariablePropertyExpression::prepare() {
-    // TODO(dutor)
+Status AliasPropertyExpression::prepare() {
+    context_->addAliasProp(*alias_, *prop_);
     return Status::OK();
 }
 
-
-void VariablePropertyExpression::encode(Cord &cord) const {
+void AliasPropertyExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(var_->size());
-    cord << *var_;
-    cord << static_cast<uint16_t>(prop_->size());
-    cord << *prop_;
-}
-
-
-const char* VariablePropertyExpression::decode(const char *pos, const char *end) {
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
-
-        THROW_IF_NO_SPACE(pos, end, size);
-        var_ = std::make_unique<std::string>(pos, size);
-        pos += size;
-    }
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
-
-        THROW_IF_NO_SPACE(pos, end, size);
-        prop_ = std::make_unique<std::string>(pos, size);
-        pos += size;
-    }
-
-    return pos;
-}
-
-
-std::string EdgePropertyExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += *alias_;
-    buf += ".";
-    buf += *prop_;
-    return buf;
-}
-
-
-VariantType EdgePropertyExpression::eval() const {
-    return context_->getters().getEdgeProp(*prop_);
-}
-
-
-Status EdgePropertyExpression::prepare() {
-    return context_->addAliasProp(*alias_, *prop_);
-}
-
-
-void EdgePropertyExpression::encode(Cord &cord) const {
-    // TODO(dutor) We better replace `alias_' with integral edge type
-    cord << kindToInt(kind());
+    cord << static_cast<uint16_t>(ref_->size());
+    cord << *ref_;
     cord << static_cast<uint16_t>(alias_->size());
     cord << *alias_;
     cord << static_cast<uint16_t>(prop_->size());
     cord << *prop_;
 }
 
-
-const char* EdgePropertyExpression::decode(const char *pos, const char *end) {
+const char* AliasPropertyExpression::decode(const char *pos, const char *end) {
     {
         THROW_IF_NO_SPACE(pos, end, 2UL);
         auto size = *reinterpret_cast<const uint16_t*>(pos);
         pos += 2;
 
-        THROW_IF_NO_SPACE(pos, end, size);
+        THROW_IF_NO_SPACE(pos, end, static_cast<uint64_t>(size));
+        ref_ = std::make_unique<std::string>(pos, size);
+        pos += size;
+    }
+    {
+        THROW_IF_NO_SPACE(pos, end, 2UL);
+        auto size = *reinterpret_cast<const uint16_t*>(pos);
+        pos += 2;
+
+        THROW_IF_NO_SPACE(pos, end, static_cast<uint64_t>(size));
         alias_ = std::make_unique<std::string>(pos, size);
         pos += size;
     }
@@ -325,7 +190,7 @@ const char* EdgePropertyExpression::decode(const char *pos, const char *end) {
         auto size = *reinterpret_cast<const uint16_t*>(pos);
         pos += 2;
 
-        THROW_IF_NO_SPACE(pos, end, size);
+        THROW_IF_NO_SPACE(pos, end, static_cast<uint64_t>(size));
         prop_ = std::make_unique<std::string>(pos, size);
         pos += size;
     }
@@ -333,274 +198,270 @@ const char* EdgePropertyExpression::decode(const char *pos, const char *end) {
     return pos;
 }
 
-
-std::string EdgeTypeExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += *alias_;
-    buf += "._type";
-    return buf;
+InputPropertyExpression::InputPropertyExpression(std::string *prop) {
+    kind_ = kInputProp;
+    ref_.reset(new std::string(INPUT_REF));
+    alias_.reset(new std::string(""));
+    prop_.reset(prop);
 }
 
-
-VariantType EdgeTypeExpression::eval() const {
-    return *alias_;
-}
-
-
-Status EdgeTypeExpression::prepare() {
-    return context_->addAliasProp(*alias_, "_type");
-}
-
-
-void EdgeTypeExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(alias_->size());
-    cord << *alias_;
-}
-
-
-const char* EdgeTypeExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 2UL);
-    auto size = *reinterpret_cast<const uint16_t*>(pos);
-    pos += 2;
-
-    THROW_IF_NO_SPACE(pos, end, size);
-    alias_ = std::make_unique<std::string>(pos, size);
-    pos += size;
-
-    return pos;
-}
-
-
-std::string EdgeSrcIdExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += *alias_;
-    buf += "._src";
-    return buf;
-}
-
-
-VariantType EdgeSrcIdExpression::eval() const {
-    return context_->getters().getEdgeProp("_src");
-}
-
-
-Status EdgeSrcIdExpression::prepare() {
-    return context_->addAliasProp(*alias_, "_src");
-}
-
-
-void EdgeSrcIdExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(alias_->size());
-    cord << *alias_;
-}
-
-
-const char* EdgeSrcIdExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 2UL);
-    auto size = *reinterpret_cast<const uint16_t*>(pos);
-    pos += 2;
-
-    THROW_IF_NO_SPACE(pos, end, size);
-    alias_ = std::make_unique<std::string>(pos, size);
-    pos += size;
-
-    return pos;
-}
-
-
-std::string EdgeDstIdExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += *alias_;
-    buf += "._dst";
-    return buf;
-}
-
-
-VariantType EdgeDstIdExpression::eval() const {
-    return context_->getters().getEdgeProp("_dst");
-}
-
-
-Status EdgeDstIdExpression::prepare() {
-    return context_->addAliasProp(*alias_, "_dst");
-}
-
-
-void EdgeDstIdExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(alias_->size());
-    cord << *alias_;
-}
-
-
-const char* EdgeDstIdExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 2UL);
-    auto size = *reinterpret_cast<const uint16_t*>(pos);
-    pos += 2;
-
-    THROW_IF_NO_SPACE(pos, end, size);
-    alias_ = std::make_unique<std::string>(pos, size);
-    pos += size;
-
-    return pos;
-}
-
-
-std::string EdgeRankExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += *alias_;
-    buf += "._rank";
-    return buf;
-}
-
-
-VariantType EdgeRankExpression::eval() const {
-    return context_->getters().getEdgeProp("_rank");
-}
-
-
-Status EdgeRankExpression::prepare() {
-    return context_->addAliasProp(*alias_, "_rank");
-}
-
-
-void EdgeRankExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(alias_->size());
-    cord << *alias_;
-}
-
-
-const char* EdgeRankExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 2UL);
-    auto size = *reinterpret_cast<const uint16_t*>(pos);
-    pos += 2;
-
-    THROW_IF_NO_SPACE(pos, end, size);
-    alias_ = std::make_unique<std::string>(pos, size);
-    pos += size;
-
-    return pos;
-}
-
-
-std::string SourcePropertyExpression::toString() const {
-    std::string buf;
-    buf.reserve(64);
-    buf += "$^.";
-    buf += *tag_;
-    buf += ".";
-    buf += *prop_;
-    return buf;
-}
-
-
-VariantType SourcePropertyExpression::eval() const {
-    return context_->getters().getSrcTagProp(*tag_, *prop_);
-}
-
-
-Status SourcePropertyExpression::prepare() {
-    context_->addSrcTagProp(*tag_, *prop_);
+Status InputPropertyExpression::prepare() {
+    context_->addInputProp(*prop_);
     return Status::OK();
 }
 
 
-void SourcePropertyExpression::encode(Cord &cord) const {
-    cord << kindToInt(kind());
-    cord << static_cast<uint16_t>(tag_->size());
-    cord << *tag_;
-    cord << static_cast<uint16_t>(prop_->size());
-    cord << *prop_;
+OptVariantType InputPropertyExpression::eval(Getters &getters) const {
+    if (getters.getInputProp == nullptr) {
+        return Status::Error("`getInputProp' function is not implemented");
+    }
+    return getters.getInputProp(*prop_);
+}
+
+Status
+InputPropertyExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+DestPropertyExpression::DestPropertyExpression(std::string *tag, std::string *prop) {
+    kind_ = kDestProp;
+    ref_.reset(new std::string(DST_REF));
+    alias_.reset(tag);
+    prop_.reset(prop);
+}
+
+OptVariantType DestPropertyExpression::eval(Getters &getters) const {
+    if (getters.getDstTagProp == nullptr) {
+        return Status::Error("`getDstTagProp' function is not implemented");
+    }
+    return getters.getDstTagProp(*alias_, *prop_);
+}
+
+Status DestPropertyExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status DestPropertyExpression::prepare() {
+    context_->addDstTagProp(*alias_, *prop_);
+    return Status::OK();
 }
 
 
-const char* SourcePropertyExpression::decode(const char *pos, const char *end) {
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
+VariablePropertyExpression::VariablePropertyExpression(std::string *var, std::string *prop) {
+    kind_ = kVariableProp;
+    ref_.reset(new std::string(VAR_REF));
+    alias_.reset(var);
+    prop_.reset(prop);
+}
 
-        THROW_IF_NO_SPACE(pos, end, size);
-        tag_ = std::make_unique<std::string>(pos, size);
-        pos += size;
+OptVariantType VariablePropertyExpression::eval(Getters &getters) const {
+    if (getters.getVariableProp == nullptr) {
+        return Status::Error("`getVariableProp' function is not implemented");
     }
-    {
-        THROW_IF_NO_SPACE(pos, end, 2UL);
-        auto size = *reinterpret_cast<const uint16_t*>(pos);
-        pos += 2;
+    return getters.getVariableProp(*prop_);
+}
 
-        THROW_IF_NO_SPACE(pos, end, size);
-        prop_ = std::make_unique<std::string>(pos, size);
-        pos += size;
+Status VariablePropertyExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
     }
+    visitor(this);
+    return Status::OK();
+}
 
-    return pos;
+Status VariablePropertyExpression::prepare() {
+    context_->addVariableProp(*alias_, *prop_);
+    return Status::OK();
+}
+
+OptVariantType EdgeTypeExpression::eval(Getters &getters) const {
+    if (getters.getAliasProp == nullptr) {
+        return Status::Error("`getAliasProp' function is not implemented");
+    }
+    return getters.getAliasProp(*alias_, *prop_);
+}
+
+Status EdgeTypeExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status EdgeTypeExpression::prepare() {
+    context_->addAliasProp(*alias_, *prop_);
+    return Status::OK();
+}
+
+
+OptVariantType EdgeSrcIdExpression::eval(Getters &getters) const {
+    if (getters.getAliasProp == nullptr) {
+        return Status::Error("`getAliasProp' function is not implemented");
+    }
+    return getters.getAliasProp(*alias_, *prop_);
+}
+
+Status EdgeSrcIdExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status EdgeSrcIdExpression::prepare() {
+    context_->addAliasProp(*alias_, *prop_);
+    return Status::OK();
+}
+
+
+OptVariantType EdgeDstIdExpression::eval(Getters &getters) const {
+    if (getters.getEdgeDstId == nullptr) {
+        return Status::Error("`getEdgeDstId' function is not implemented");
+    }
+    return getters.getEdgeDstId(*alias_);
+}
+
+Status EdgeDstIdExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status EdgeDstIdExpression::prepare() {
+    context_->addAliasProp(*alias_, *prop_);
+    return Status::OK();
+}
+
+
+OptVariantType EdgeRankExpression::eval(Getters &getters) const {
+    if (getters.getAliasProp == nullptr) {
+        return Status::Error("`getAliasProp' function is not implemented");
+    }
+    return getters.getAliasProp(*alias_, *prop_);
+}
+
+Status EdgeRankExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status EdgeRankExpression::prepare() {
+    context_->addAliasProp(*alias_, *prop_);
+    return Status::OK();
+}
+
+
+SourcePropertyExpression::SourcePropertyExpression(std::string *tag, std::string *prop) {
+    kind_ = kSourceProp;
+    ref_.reset(new std::string(SRC_REF));
+    alias_.reset(tag);
+    prop_.reset(prop);
+}
+
+OptVariantType SourcePropertyExpression::eval(Getters &getters) const {
+    if (getters.getSrcTagProp== nullptr) {
+        return Status::Error("`getSrcTagProp' function is not implemented");
+    }
+    return getters.getSrcTagProp(*alias_, *prop_);
+}
+
+Status SourcePropertyExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status SourcePropertyExpression::prepare() {
+    context_->addSrcTagProp(*alias_, *prop_);
+    return Status::OK();
 }
 
 
 std::string PrimaryExpression::toString() const {
     char buf[1024];
     switch (operand_.which()) {
-        case kBool:
-            snprintf(buf, sizeof(buf), "%s", boost::get<bool>(operand_) ? "true" : "false");
-            break;
-        case kInt:
+        case VAR_INT64:
             snprintf(buf, sizeof(buf), "%ld", boost::get<int64_t>(operand_));
             break;
-        case kDouble:
-            return std::to_string(boost::get<double>(operand_));
-        case kString:
-            return "\"" + boost::get<std::string>(operand_) + "\"";
+        case VAR_DOUBLE: {
+            int digits10 = std::numeric_limits<double>::digits10;
+            std::string fmt = folly::sformat("%.{}lf", digits10);
+            snprintf(buf, sizeof(buf), fmt.c_str(), boost::get<double>(operand_));
+            break;
+        }
+        case VAR_BOOL:
+            snprintf(buf, sizeof(buf), "%s", boost::get<bool>(operand_) ? "true" : "false");
+            break;
+        case VAR_STR:
+            return boost::get<std::string>(operand_);
     }
     return buf;
 }
 
-
-VariantType PrimaryExpression::eval() const {
+OptVariantType PrimaryExpression::eval(Getters &getters) const {
+    UNUSED(getters);
     switch (operand_.which()) {
-        case kBool:
-            return boost::get<bool>(operand_);
-            break;
-        case kInt:
+        case VAR_INT64:
             return boost::get<int64_t>(operand_);
             break;
-        case kDouble:
+        case VAR_DOUBLE:
             return boost::get<double>(operand_);
             break;
-        case kString:
+        case VAR_BOOL:
+            return boost::get<bool>(operand_);
+            break;
+        case VAR_STR:
             return boost::get<std::string>(operand_);
     }
-    return std::string("Unknown");
+
+    return OptVariantType(Status::Error("Unknown type"));
 }
 
+Status PrimaryExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
 
 Status PrimaryExpression::prepare() {
     return Status::OK();
 }
 
 
-void PrimaryExpression::encode(Cord &cord) const {
+void PrimaryExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
     uint8_t which = operand_.which();
     cord << which;
     switch (which) {
-        case kBool:
-            cord << static_cast<uint8_t>(boost::get<bool>(operand_));
-            break;
-        case kInt:
+        case VAR_INT64:
             cord << boost::get<int64_t>(operand_);
             break;
-        case kDouble:
+        case VAR_DOUBLE:
             cord << boost::get<double>(operand_);
             break;
-        case kString: {
+        case VAR_BOOL:
+            cord << static_cast<uint8_t>(boost::get<bool>(operand_));
+            break;
+        case VAR_STR: {
             auto &str = boost::get<std::string>(operand_);
             cord << static_cast<uint16_t>(str.size());
             cord << str;
@@ -613,28 +474,28 @@ void PrimaryExpression::encode(Cord &cord) const {
 
 
 const char* PrimaryExpression::decode(const char *pos, const char *end) {
-    THROW_IF_NO_SPACE(pos, end, 1);
+    THROW_IF_NO_SPACE(pos, end, 1UL);
     auto which = *reinterpret_cast<const uint8_t*>(pos++);
-    switch (static_cast<Which>(which)) {
-        case kBool:
-            THROW_IF_NO_SPACE(pos, end, 1UL);
-            operand_ = *reinterpret_cast<const bool*>(pos++);
-            break;
-        case kInt:
+    switch (which) {
+        case VAR_INT64:
             THROW_IF_NO_SPACE(pos, end, 8UL);
             operand_ = *reinterpret_cast<const int64_t*>(pos);
             pos += 8;
             break;
-        case kDouble:
+        case VAR_DOUBLE:
             THROW_IF_NO_SPACE(pos, end, 8UL);
             operand_ = *reinterpret_cast<const double*>(pos);
             pos += 8;
             break;
-        case kString: {
+        case VAR_BOOL:
+            THROW_IF_NO_SPACE(pos, end, 1UL);
+            operand_ = *reinterpret_cast<const bool*>(pos++);
+            break;
+        case VAR_STR: {
             THROW_IF_NO_SPACE(pos, end, 2UL);
             auto size = *reinterpret_cast<const uint16_t*>(pos);
             pos += 2;
-            THROW_IF_NO_SPACE(pos, end, size);
+            THROW_IF_NO_SPACE(pos, end, static_cast<uint64_t>(size));
             operand_ = std::string(pos, size);
             pos += size;
             break;
@@ -662,17 +523,32 @@ std::string FunctionCallExpression::toString() const {
     return buf;
 }
 
-
-VariantType FunctionCallExpression::eval() const {
+OptVariantType FunctionCallExpression::eval(Getters &getters) const {
     std::vector<VariantType> args;
-    args.resize(args_.size());
-    auto eval = [] (auto &expr) {
-        return expr->eval();
-    };
-    std::transform(args_.begin(), args_.end(), args.begin(), eval);
-    return function_(args);
+
+    for (auto it = args_.cbegin(); it != args_.cend(); ++it) {
+        auto result = (*it)->eval(getters);
+        if (!result.ok()) {
+            return result;
+        }
+        args.emplace_back(std::move(result.value()));
+    }
+
+    // TODO(simon.liu)
+    auto r = function_(args);
+    return r;
 }
 
+Status FunctionCallExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    for (const auto &it : args_) {
+        it->traversal(visitor);
+    }
+    visitor(this);
+    return Status::OK();
+}
 
 Status FunctionCallExpression::prepare() {
     auto result = FunctionManager::get(*name_, args_.size());
@@ -693,7 +569,7 @@ Status FunctionCallExpression::prepare() {
 }
 
 
-void FunctionCallExpression::encode(Cord &cord) const {
+void FunctionCallExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
 
     cord << static_cast<uint16_t>(name_->size());
@@ -711,7 +587,7 @@ const char* FunctionCallExpression::decode(const char *pos, const char *end) {
     auto size = *reinterpret_cast<const uint16_t*>(pos);
     pos += 2;
 
-    THROW_IF_NO_SPACE(pos, end, size);
+    THROW_IF_NO_SPACE(pos, end, static_cast<uint64_t>(size));
     name_ = std::make_unique<std::string>(pos, size);
     pos += size;
 
@@ -728,6 +604,40 @@ const char* FunctionCallExpression::decode(const char *pos, const char *end) {
     return pos;
 }
 
+std::string UUIDExpression::toString() const {
+    return folly::stringPrintf("uuid(%s)", field_->c_str());
+}
+
+OptVariantType UUIDExpression::eval(Getters &getters) const {
+    UNUSED(getters);
+     auto client = context_->storageClient();
+     auto space = context_->space();
+     auto uuidResult = client->getUUID(space, *field_).get();
+     if (!uuidResult.ok()) {
+        LOG(ERROR) << "Get UUID failed for " << toString() << ", status " << uuidResult.status();
+        return OptVariantType(Status::Error("Get UUID Failed"));
+     }
+     auto v = std::move(uuidResult).value();
+     for (auto& rc : v.get_result().get_failed_codes()) {
+        LOG(ERROR) << "Get UUID failed, error " << static_cast<int32_t>(rc.get_code())
+                   << ", part " << rc.get_part_id() << ", str id " << toString();
+        return OptVariantType(Status::Error("Get UUID Failed"));
+     }
+     VLOG(3) << "Get UUID from " << *field_ << " to " << v.get_id();
+     return v.get_id();
+}
+
+Status UUIDExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    visitor(this);
+    return Status::OK();
+}
+
+Status UUIDExpression::prepare() {
+    return Status::OK();
+}
 
 std::string UnaryExpression::toString() const {
     std::string buf;
@@ -749,30 +659,45 @@ std::string UnaryExpression::toString() const {
     return buf;
 }
 
-
-VariantType UnaryExpression::eval() const {
-    auto value = operand_->eval();
-    if (op_ == PLUS) {
-        return value;
-    } else if (op_ == NEGATE) {
-        if (isInt(value)) {
-            return -asInt(value);
-        } else if (isDouble(value)) {
-            return -asDouble(value);
+OptVariantType UnaryExpression::eval(Getters &getters) const {
+    auto value = operand_->eval(getters);
+    if (value.ok()) {
+        if (op_ == PLUS) {
+            return value;
+        } else if (op_ == NEGATE) {
+            if (isInt(value.value())) {
+                return OptVariantType(-asInt(value.value()));
+            } else if (isDouble(value.value())) {
+                return OptVariantType(-asDouble(value.value()));
+            } else {
+                return OptVariantType(
+                    Status::Error(folly::sformat("attempt to perform unary arithmetic on a `{}'",
+                                                 VARIANT_TYPE_NAME[value.value().which()])));
+            }
+            return Status::Error("Wrong value type for !");
+        } else {
+            return OptVariantType(!asBool(value.value()));
         }
-    } else {
-        return !asBool(value);
     }
+
     return value;
 }
 
+Status UnaryExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    operand_->traversal(visitor);
+    visitor(this);
+    return Status::OK();
+}
 
 Status UnaryExpression::prepare() {
     return operand_->prepare();
 }
 
 
-void UnaryExpression::encode(Cord &cord) const {
+void UnaryExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
     cord << static_cast<uint8_t>(op_);
     operand_->encode(cord);
@@ -791,17 +716,15 @@ const char* UnaryExpression::decode(const char *pos, const char *end) {
 
 std::string columnTypeToString(ColumnType type) {
     switch (type) {
-        case INT:
+        case ColumnType::INT:
             return "int";
-        case STRING:
+        case ColumnType::STRING:
             return "string";
-        case DOUBLE:
+        case ColumnType::DOUBLE:
             return "double";
-        case BIGINT:
-            return "bigint";
-        case BOOL:
+        case ColumnType::BOOL:
             return "bool";
-        case TIMESTAMP:
+        case ColumnType::TIMESTAMP:
             return  "timestamp";
         default:
             return "unknown";
@@ -810,22 +733,65 @@ std::string columnTypeToString(ColumnType type) {
 
 
 std::string TypeCastingExpression::toString() const {
-    return "";
+    std::string buf;
+    buf.reserve(256);
+
+    buf += "(";
+    buf += columnTypeToString(type_);
+    buf += ")";
+    buf += operand_->toString();
+
+    return buf;
 }
 
 
-VariantType TypeCastingExpression::eval() const {
-    return toString();
+OptVariantType TypeCastingExpression::eval(Getters &getters) const {
+    auto result = operand_->eval(getters);
+    if (!result.ok()) {
+        return result;
+    }
+
+    switch (type_) {
+        case ColumnType::INT:
+        case ColumnType::TIMESTAMP:
+            return Expression::toInt(result.value());
+        case ColumnType::STRING:
+            return Expression::toString(result.value());
+        case ColumnType::DOUBLE:
+            return Expression::toDouble(result.value());
+        case ColumnType::BOOL:
+            return Expression::toBool(result.value());
+    }
+    LOG(FATAL) << "casting to unknown type: " << static_cast<int>(type_);
 }
 
+Status TypeCastingExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    operand_->traversal(visitor);
+    visitor(this);
+    return Status::OK();
+}
 
 Status TypeCastingExpression::prepare() {
     return operand_->prepare();
 }
 
 
-void TypeCastingExpression::encode(Cord &cord) const {
-    UNUSED(cord);
+void TypeCastingExpression::encode(ICord<> &cord) const {
+    cord << kindToInt(kind());
+    cord << static_cast<uint8_t>(type_);
+    operand_->encode(cord);
+}
+
+
+const char* TypeCastingExpression::decode(const char *pos, const char *end) {
+    THROW_IF_NO_SPACE(pos, end, 2UL);
+    type_ = *reinterpret_cast<const ColumnType*>(pos++);
+
+    operand_ = makeExpr(*reinterpret_cast<const uint8_t*>(pos++));
+    return operand_->decode(pos, end);
 }
 
 
@@ -850,54 +816,178 @@ std::string ArithmeticExpression::toString() const {
         case MOD:
             buf += '%';
             break;
+        case XOR:
+            buf += '^';
+            break;
     }
     buf.append(right_->toString());
     buf += ')';
     return buf;
 }
 
-
-VariantType ArithmeticExpression::eval() const {
-    auto left = left_->eval();
-    auto right = right_->eval();
-    switch (op_) {
-    case ADD:
-        assert((isArithmetic(left) && isArithmetic(right))
-                || (isString(left) && isString(right)));
-        if (isArithmetic(left) && isArithmetic(right)) {
-            if (isDouble(left) || isDouble(right)) {
-                return asDouble(left) + asDouble(right);
-            }
-            return asInt(left) + asInt(right);
-        }
-        return asString(left) + asString(right);
-    case SUB:
-        assert(isArithmetic(left) && isArithmetic(right));
-        if (isDouble(left) || isDouble(right)) {
-            return asDouble(left) - asDouble(right);
-        }
-        return asInt(left) - asInt(right);
-    case MUL:
-        assert(isArithmetic(left) && isArithmetic(right));
-        if (isDouble(left) || isDouble(right)) {
-            return asDouble(left) * asDouble(right);
-        }
-        return asInt(left) * asInt(right);
-    case DIV:
-        assert(isArithmetic(left) && isArithmetic(right));
-        if (isDouble(left) || isDouble(right)) {
-            return asDouble(left) / asDouble(right);
-        }
-        return asInt(left) / asInt(right);
-    case MOD:
-        assert(isInt(left) && isInt(right));
-        return asInt(left) % asInt(right);
-    default:
-        DCHECK(false);
+OptVariantType ArithmeticExpression::eval(Getters &getters) const {
+    auto left = left_->eval(getters);
+    auto right = right_->eval(getters);
+    if (!left.ok()) {
+        return left;
     }
-    return false;
+
+    if (!right.ok()) {
+        return right;
+    }
+
+    auto l = left.value();
+    auto r = right.value();
+
+    static constexpr int64_t maxInt = std::numeric_limits<int64_t>::max();
+    static constexpr int64_t minInt = std::numeric_limits<int64_t>::min();
+
+    auto isAddOverflow = [] (int64_t lv, int64_t rv) -> bool {
+        if (lv >= 0 && rv >= 0) {
+            return maxInt - lv < rv;
+        } else if (lv < 0 && rv < 0) {
+            return minInt - lv > rv;
+        } else {
+            return false;
+        }
+    };
+
+    auto isSubOverflow = [] (int64_t lv, int64_t rv) -> bool {
+        if (lv > 0 && rv < 0) {
+            return maxInt - lv < -rv;
+        } else if (lv < 0 && rv > 0) {
+            return minInt - lv > -rv;
+        } else {
+            return false;
+        }
+    };
+
+    auto isMulOverflow = [] (int64_t lv, int64_t rv) -> bool {
+        if (lv > 0 && rv > 0) {
+            return maxInt / lv < rv;
+        } else if (lv < 0 && rv < 0) {
+            return maxInt / lv > rv;
+        } else if (lv > 0 && rv < 0) {
+            return minInt / lv > rv;
+        } else if (lv < 0 && rv > 0) {
+            return minInt / rv > lv;
+        } else {
+            return false;
+        }
+    };
+
+    switch (op_) {
+        case ADD:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return OptVariantType(asDouble(l) + asDouble(r));
+                }
+                int64_t lValue = asInt(l);
+                int64_t rValue = asInt(r);
+                if (isAddOverflow(lValue, rValue)) {
+                    return Status::Error(folly::stringPrintf("Out of range %ld + %ld",
+                                lValue, rValue));
+                }
+                return OptVariantType(lValue + rValue);
+            }
+
+            if (isString(l) && isString(r)) {
+                return OptVariantType(asString(l) + asString(r));
+            }
+            break;
+        case SUB:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return OptVariantType(asDouble(l) - asDouble(r));
+                }
+                int64_t lValue = asInt(l);
+                int64_t rValue = asInt(r);
+                if (isSubOverflow(lValue, rValue)) {
+                    return Status::Error(folly::stringPrintf("Out of range %ld - %ld",
+                                lValue, rValue));
+                }
+                return OptVariantType(lValue - rValue);
+            }
+            break;
+        case MUL:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return OptVariantType(asDouble(l) * asDouble(r));
+                }
+                int64_t lValue = asInt(l);
+                int64_t rValue = asInt(r);
+                if (isMulOverflow(lValue, rValue)) {
+                    return Status::Error("Out of range %ld * %ld", lValue, rValue);
+                }
+                return OptVariantType(lValue * rValue);
+            }
+            break;
+        case DIV:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    if (abs(asDouble(r)) < 1e-8) {
+                        // When Null is supported, should be return NULL
+                        return Status::Error("Division by zero");
+                    }
+                    return OptVariantType(asDouble(l) / asDouble(r));
+                }
+
+                int64_t lValue = asInt(l);
+                int64_t rValue = asInt(r);
+                if (abs(rValue) == 0) {
+                    // When Null is supported, should be return NULL
+                    return Status::Error("Division by zero");
+                }
+
+                if (lValue == minInt && rValue == -1) {
+                    return Status::Error("Out of range %ld * %ld", lValue, rValue);
+                }
+                return OptVariantType(asInt(l) / asInt(r));
+            }
+            break;
+        case MOD:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    if (abs(asDouble(r)) < 1e-8) {
+                        // When Null is supported, should be return NULL
+                        return Status::Error("Division by zero");
+                    }
+                    return fmod(asDouble(l), asDouble(r));
+                }
+                if (abs(asInt(r)) == 0) {
+                    // When Null is supported, should be return NULL
+                    return Status::Error("Division by zero");
+                }
+                return OptVariantType(asInt(l) % asInt(r));
+            }
+            break;
+        case XOR:
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return (static_cast<int64_t>(std::round(asDouble(l)))
+                                ^ static_cast<int64_t>(std::round(asDouble(r))));
+                }
+                return OptVariantType(asInt(l) ^ asInt(r));
+            }
+            break;
+        default:
+            DCHECK(false);
+    }
+
+    return OptVariantType(Status::Error(folly::sformat(
+        "attempt to perform arithmetic on `{}' with `{}'",
+        VARIANT_TYPE_NAME[l.which()], VARIANT_TYPE_NAME[r.which()])));
 }
 
+Status ArithmeticExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    left_->traversal(visitor);
+    right_->traversal(visitor);
+    visitor(this);
+    return Status::OK();
+}
 
 Status ArithmeticExpression::prepare() {
     auto status = left_->prepare();
@@ -912,7 +1002,7 @@ Status ArithmeticExpression::prepare() {
 }
 
 
-void ArithmeticExpression::encode(Cord &cord) const {
+void ArithmeticExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
     cord << static_cast<uint8_t>(op_);
     left_->encode(cord);
@@ -958,39 +1048,99 @@ std::string RelationalExpression::toString() const {
         case NE:
             buf += "!=";
             break;
+        case CONTAINS:
+            buf += " CONTAINS ";
+            break;
     }
     buf.append(right_->toString());
     buf += ')';
     return buf;
 }
 
+OptVariantType RelationalExpression::eval(Getters &getters) const {
+    auto left = left_->eval(getters);
+    auto right = right_->eval(getters);
 
-VariantType RelationalExpression::eval() const {
-    auto left = left_->eval();
-    auto right = right_->eval();
+    if (!left.ok()) {
+        return left;
+    }
+
+    if (!right.ok()) {
+        return right;
+    }
+
+    auto l = left.value();
+    auto r = right.value();
+    if (l.which() != r.which()) {
+        auto s = implicitCasting(l, r);
+        if (!s.ok()) {
+            return s;
+        }
+    }
+
     switch (op_) {
         case LT:
-            return left < right;
+            return OptVariantType(l < r);
         case LE:
-            return left <= right;
+            return OptVariantType(l <= r);
         case GT:
-            return left > right;
+            return OptVariantType(l > r);
         case GE:
-            return left >= right;
+            return OptVariantType(l >= r);
         case EQ:
-            if (isDouble(left) || isDouble(right)) {
-                return almostEqual(asDouble(left), asDouble(right));
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return OptVariantType(
+                        almostEqual(asDouble(l), asDouble(r)));
+                }
             }
-            return left == right;
+            return OptVariantType(l == r);
         case NE:
-            if (isDouble(left) || isDouble(right)) {
-                return !almostEqual(asDouble(left), asDouble(right));
+            if (isArithmetic(l) && isArithmetic(r)) {
+                if (isDouble(l) || isDouble(r)) {
+                    return OptVariantType(
+                        !almostEqual(asDouble(l), asDouble(r)));
+                }
             }
-            return left != right;
+            return OptVariantType(l != r);
+        case CONTAINS:
+            if (isString(l) && isString(r)) {
+                return OptVariantType(contains(asString(l), asString(r)));
+            }
     }
-    return false;
+
+    return OptVariantType(Status::Error("Wrong operator"));
 }
 
+Status RelationalExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    left_->traversal(visitor);
+    right_->traversal(visitor);
+    visitor(this);
+    return Status::OK();
+}
+
+Status RelationalExpression::implicitCasting(VariantType &lhs, VariantType &rhs) const {
+    // Rule: bool -> int64_t -> double
+    if (lhs.which() == VAR_STR || rhs.which() == VAR_STR) {
+        return Status::Error("A string type can not be compared with a non-string type.");
+    } else if (lhs.which() == VAR_DOUBLE || rhs.which() == VAR_DOUBLE) {
+        lhs = toDouble(lhs);
+        rhs = toDouble(rhs);
+    } else if (lhs.which() == VAR_INT64 || rhs.which() == VAR_INT64) {
+        lhs = toInt(lhs);
+        rhs = toInt(rhs);
+    } else if (lhs.which() == VAR_BOOL || rhs.which() == VAR_BOOL) {
+        // No need do cast here.
+    } else {
+        // If the variant type is expanded, we should update the rule.
+        LOG(FATAL) << "Unknown type: " << lhs.which() << ", " << rhs.which();
+    }
+
+    return Status::OK();
+}
 
 Status RelationalExpression::prepare() {
     auto status = left_->prepare();
@@ -1005,7 +1155,7 @@ Status RelationalExpression::prepare() {
 }
 
 
-void RelationalExpression::encode(Cord &cord) const {
+void RelationalExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
     cord << static_cast<uint8_t>(op_);
     left_->encode(cord);
@@ -1016,7 +1166,9 @@ void RelationalExpression::encode(Cord &cord) const {
 const char* RelationalExpression::decode(const char *pos, const char *end) {
     THROW_IF_NO_SPACE(pos, end, 2UL);
     op_ = *reinterpret_cast<const Operator*>(pos++);
-    DCHECK(op_ == LT || op_ == LE || op_ == GT || op_ == GE || op_ == EQ || op_ == NE);
+    DCHECK(op_ == LT || op_ == LE || op_ == GT ||
+            op_ == GE || op_ == EQ || op_ == NE ||
+            op_ == CONTAINS);
 
     left_ = makeExpr(*reinterpret_cast<const uint8_t*>(pos++));
     pos = left_->decode(pos, end);
@@ -1039,27 +1191,54 @@ std::string LogicalExpression::toString() const {
         case OR:
             buf += "||";
             break;
+        case XOR:
+            buf += "XOR";
+            break;
     }
     buf.append(right_->toString());
     buf += ')';
     return buf;
 }
 
+OptVariantType LogicalExpression::eval(Getters &getters) const {
+    auto left = left_->eval(getters);
+    auto right = right_->eval(getters);
 
-VariantType LogicalExpression::eval() const {
+    if (!left.ok()) {
+        return left;
+    }
+
+    if (!right.ok()) {
+        return right;
+    }
+
     if (op_ == AND) {
-        if (!asBool(left_->eval())) {
-            return false;
+        if (!asBool(left.value())) {
+            return OptVariantType(false);
         }
-        return asBool(right_->eval());
+        return OptVariantType(asBool(right.value()));
+    } else if (op_ == OR) {
+        if (asBool(left.value())) {
+            return OptVariantType(true);
+        }
+        return OptVariantType(asBool(right.value()));
     } else {
-        if (asBool(left_->eval())) {
-            return true;
+        if (asBool(left.value()) == asBool(right.value())) {
+            return OptVariantType(false);
         }
-        return asBool(right_->eval());
+        return OptVariantType(true);
     }
 }
 
+Status LogicalExpression::traversal(std::function<void(const Expression*)> visitor) const {
+    if (!visitor) {
+        return Status::Error("Null visitor.");
+    }
+    left_->traversal(visitor);
+    right_->traversal(visitor);
+    visitor(this);
+    return Status::OK();
+}
 
 Status LogicalExpression::prepare() {
     auto status = left_->prepare();
@@ -1070,8 +1249,7 @@ Status LogicalExpression::prepare() {
     return Status::OK();
 }
 
-
-void LogicalExpression::encode(Cord &cord) const {
+void LogicalExpression::encode(ICord<> &cord) const {
     cord << kindToInt(kind());
     cord << static_cast<uint8_t>(op_);
     left_->encode(cord);
@@ -1082,7 +1260,7 @@ void LogicalExpression::encode(Cord &cord) const {
 const char* LogicalExpression::decode(const char *pos, const char *end) {
     THROW_IF_NO_SPACE(pos, end, 2UL);
     op_ = *reinterpret_cast<const Operator*>(pos++);
-    DCHECK(op_ == AND || op_ == OR);
+    DCHECK(op_ == AND || op_ == OR || op_ == XOR);
 
     left_ = makeExpr(*reinterpret_cast<const uint8_t*>(pos++));
     pos = left_->decode(pos, end);

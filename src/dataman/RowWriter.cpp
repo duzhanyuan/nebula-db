@@ -77,7 +77,7 @@ void RowWriter::encodeTo(std::string& encoded) noexcept {
 
 Schema RowWriter::moveSchema() {
     if (schemaWriter_) {
-        return std::move(schemaWriter_->moveSchema());
+        return schemaWriter_->moveSchema();
     } else {
         return Schema();
     }
@@ -171,7 +171,7 @@ RowWriter& RowWriter::operator<<(folly::StringPiece v) noexcept {
     switch (type->get_type()) {
         case SupportedType::STRING: {
             writeInt(v.size());
-            cord_ << v;
+            cord_.write(v.data(), v.size());
             break;
         }
         default: {
@@ -225,7 +225,8 @@ RowWriter& RowWriter::operator<<(Skip&& skip) noexcept {
                 cord_ << false;
                 break;
             }
-            case SupportedType::INT: {
+            case SupportedType::INT:
+            case SupportedType::TIMESTAMP: {
                 writeInt(0);
                 break;
             }
@@ -241,8 +242,7 @@ RowWriter& RowWriter::operator<<(Skip&& skip) noexcept {
                 writeInt(0);
                 break;
             }
-            case SupportedType::VID:
-            case SupportedType::TIMESTAMP: {
+            case SupportedType::VID: {
                 cord_ << static_cast<uint64_t>(0);
                 break;
             }
@@ -263,4 +263,3 @@ RowWriter& RowWriter::operator<<(Skip&& skip) noexcept {
 }
 
 }  // namespace nebula
-

@@ -7,7 +7,6 @@
 #include "base/Base.h"
 #include <gtest/gtest.h>
 #include "kvstore/wal/FileBasedWal.h"
-#include "kvstore/wal/BufferFlusher.h"
 #include "fs/TempDir.h"
 
 namespace nebula {
@@ -34,17 +33,14 @@ static const char* kLongMsg =
     "abcdefghijklmnopqrstuvwxyz123456789abcdefghijklmnopqrstuvwxyz123456789"
     "abcdefghijklmnopqrstuvwxyz123456789abcdefghijklmnopqrstuvwxyz-%06d";
 
-std::unique_ptr<BufferFlusher> flusher;
-
 
 TEST(FileBasedWal, AppendLogs) {
     FileBasedWalPolicy policy;
     TempDir walDir("/tmp/testWal.XXXXXX");
 
-    // Create a new WAL, add one log and close it
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
@@ -61,8 +57,8 @@ TEST(FileBasedWal, AppendLogs) {
 
     // Now let's open it to read
     wal = FileBasedWal::getWal(walDir.path(),
+                               "",
                                policy,
-                               flusher.get(),
                                [](LogID, TermID, ClusterID, const std::string&) {
                                    return true;
                                });
@@ -85,18 +81,17 @@ TEST(FileBasedWal, CacheOverflow) {
     // Force to make each file 1MB, each buffer is 1MB, and there are two
     // buffers at most
     FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
+    policy.fileSize = 1024L * 1024L;
+    policy.bufferSize = 1024L * 1024L;
     policy.numBuffers = 2;
 
     TempDir walDir("/tmp/testWal.XXXXXX");
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
-    // Create a new WAL, add one log and close it
     EXPECT_EQ(0, wal->lastLogId());
 
     // Append > 10MB logs in total
@@ -106,12 +101,7 @@ TEST(FileBasedWal, CacheOverflow) {
     }
     ASSERT_EQ(10000, wal->lastLogId());
 
-    ASSERT_EQ(2, wal.use_count());
-    // Wait one second to make sure all buffers have been flushed
-    sleep(1);
-
     // Close the wal
-    ASSERT_EQ(1, wal.use_count());
     wal.reset();
 
     // Check the number of files
@@ -120,8 +110,8 @@ TEST(FileBasedWal, CacheOverflow) {
 
     // Now let's open it to read
     wal = FileBasedWal::getWal(walDir.path(),
+                               "",
                                policy,
-                               flusher.get(),
                                [](LogID, TermID, ClusterID, const std::string&) {
                                    return true;
                                });
@@ -144,15 +134,14 @@ TEST(FileBasedWal, Rollback) {
     // Force to make each file 1MB, each buffer is 1MB, and there are two
     // buffers at most
     FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
+    policy.fileSize = 1024L * 1024L;
+    policy.bufferSize = 1024L * 1024L;
     policy.numBuffers = 2;
 
     TempDir walDir("/tmp/testWal.XXXXXX");
-    // Create a new WAL, add one log and close it
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
@@ -169,32 +158,35 @@ TEST(FileBasedWal, Rollback) {
     wal->rollbackToLog(9900);
     ASSERT_EQ(9900, wal->lastLogId());
 
-    // Try to read the last 10 logs
-    auto it = wal->iterator(9891, 9900);
-    LogID id = 9891;
-    while (it->valid()) {
-        ASSERT_EQ(id, it->logId());
-        ASSERT_EQ(folly::stringPrintf(kLongMsg, id), it->logMsg());
-        ++(*it);
-        ++id;
+    {
+        // Try to read the last 10 logs
+        auto it = wal->iterator(9891, 9900);
+        LogID id = 9891;
+        while (it->valid()) {
+            ASSERT_EQ(id, it->logId());
+            ASSERT_EQ(folly::stringPrintf(kLongMsg, id), it->logMsg());
+            ++(*it);
+            ++id;
+        }
+        EXPECT_EQ(9901, id);
     }
-    EXPECT_EQ(9901, id);
 
     // Now let's rollback even more
     wal->rollbackToLog(5000);
     ASSERT_EQ(5000, wal->lastLogId());
 
-    // Let's verify the last 10 logs
-    it = wal->iterator(4991, 5000);
-    id = 4991;
-    while (it->valid()) {
-        ASSERT_EQ(id, it->logId());
-        ASSERT_EQ(folly::stringPrintf(kLongMsg, id), it->logMsg());
-        ++(*it);
-        ++id;
+    {
+        // Let's verify the last 10 logs
+        auto it = wal->iterator(4991, 5000);
+        LogID id = 4991;
+        while (it->valid()) {
+            ASSERT_EQ(id, it->logId());
+            ASSERT_EQ(folly::stringPrintf(kLongMsg, id), it->logMsg());
+            ++(*it);
+            ++id;
+        }
+        EXPECT_EQ(5001, id);
     }
-    EXPECT_EQ(5001, id);
-
     // Now let's append 1000 more logs
     for (int i = 5001; i <= 6000; i++) {
         ASSERT_TRUE(
@@ -204,8 +196,8 @@ TEST(FileBasedWal, Rollback) {
     ASSERT_EQ(6000, wal->lastLogId());
 
     // Let's verify the last 10 logs
-    it = wal->iterator(5991, 6000);
-    id = 5991;
+    auto it = wal->iterator(5991, 6000);
+    LogID id = 5991;
     while (it->valid()) {
         ASSERT_EQ(id, it->logId());
         ASSERT_EQ(folly::stringPrintf(kLongMsg, id + 1000), it->logMsg());
@@ -213,56 +205,54 @@ TEST(FileBasedWal, Rollback) {
         ++id;
     }
     EXPECT_EQ(6001, id);
-
-    // Wait one second to make sure all buffers being flushed
-    sleep(1);
 }
 
-TEST(FileBasedWal, RollbackToFile) {
+
+TEST(FileBasedWal, RollbackThenReopen) {
     // Force to make each file 1MB, each buffer is 1MB, and there are two
     // buffers at most
     FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
+    policy.fileSize = 1024L * 1024L;
+    policy.bufferSize = 1024L * 1024L;
     policy.numBuffers = 2;
 
     TempDir walDir("/tmp/testWal.XXXXXX");
-    // Create a new WAL, add one log and close it
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
     EXPECT_EQ(0, wal->lastLogId());
     // Append > 1MB logs in total
-    for (int i = 1; i <= 1000; i++) {
+    for (int i = 1; i <= 1500; i++) {
        ASSERT_TRUE(wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
            folly::stringPrintf(kLongMsg, i)));
     }
-    ASSERT_EQ(1000, wal->lastLogId());
+    ASSERT_EQ(1500, wal->lastLogId());
 
-    // Wait a few seconds to make sure all buffers being flushed
-    sleep(2);
+    // Rollbacking to 800
+    wal->rollbackToLog(800);
+    ASSERT_EQ(800, wal->lastLogId());
 
     // Close the wal
     wal.reset();
 
     // Check the number of files
     auto files = FileUtils::listAllFilesInDir(walDir.path());
-    ASSERT_EQ(2, files.size());
+    ASSERT_EQ(1, files.size());
 
     // Now let's open it to read
     wal = FileBasedWal::getWal(walDir.path(),
+                               "",
                                policy,
-                               flusher.get(),
                                [](LogID, TermID, ClusterID, const std::string&) {
                                    return true;
                                });
-    EXPECT_EQ(1000, wal->lastLogId());
+    EXPECT_EQ(800, wal->lastLogId());
 
     // Let's verify the logs
-    auto it = wal->iterator(1, 1000);
+    auto it = wal->iterator(1, 800);
     LogID id = 1;
     while (it->valid()) {
         ASSERT_EQ(id, it->logId());
@@ -270,94 +260,21 @@ TEST(FileBasedWal, RollbackToFile) {
         ++(*it);
         ++id;
     }
-    EXPECT_EQ(1001, id);
-
-    // Appending >1M logs make sure the first buffer will be sent to
-    // flusher thread
-    for (int i = 1001; i <= 2000; i++) {
-        ASSERT_TRUE(
-            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
-                folly::stringPrintf(kLongMsg, i + 1000)));
-    }
-    ASSERT_EQ(2000, wal->lastLogId());
-
-    // Rollbacking to 900 will remove all buffer in memory
-    wal->rollbackToLog(900);
-    ASSERT_EQ(900, wal->lastLogId());
-
-    // Wait a few seconds to make sure all buffers being flushed
-    sleep(2);
-}
-
-TEST(FileBasedWal, RollbackToMemory) {
-    // Force to make each file 1MB, each buffer is 1MB, and there are two
-    // buffers at most
-    FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
-    policy.numBuffers = 2;
-
-    TempDir walDir("/tmp/testWal.XXXXXX");
-    // Create a new WAL, add one log and close it
-    auto wal = FileBasedWal::getWal(walDir.path(),
-                                    policy,
-                                    flusher.get(),
-                                    [](LogID, TermID, ClusterID, const std::string&) {
-                                        return true;
-                                    });
-    EXPECT_EQ(0, wal->lastLogId());
-
-    // Append < 1MB logs in total
-    for (int i = 1; i <= 100; i++) {
-        ASSERT_TRUE(wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
-            folly::stringPrintf(kLongMsg, i)));
-    }
-    ASSERT_EQ(100, wal->lastLogId());
-
-    // Rollback 10 logs
-    wal->rollbackToLog(90);
-    ASSERT_EQ(90, wal->lastLogId());
-
-    // Now let's append >1M more logs
-    for (int i = 91; i <= 2100; i++) {
-        ASSERT_TRUE(
-            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
-                folly::stringPrintf(kLongMsg, i + 1000)));
-    }
-    ASSERT_EQ(2100, wal->lastLogId());
-
-    // Let's verify the logs
-    auto it = wal->iterator(1, 2100);
-    LogID id = 1;
-    while (it->valid()) {
-        ASSERT_EQ(id, it->logId());
-        if (id < 91) {
-            ASSERT_EQ(folly::stringPrintf(kLongMsg, id), it->logMsg());
-        } else {
-            ASSERT_EQ(folly::stringPrintf(kLongMsg, id + 1000), it->logMsg());
-        }
-        ++(*it);
-        ++id;
-    }
-    EXPECT_EQ(2101, id);
-
-    // Wait a few seconds to make sure all buffers being flushed
-    sleep(2);
+    EXPECT_EQ(801, id);
 }
 
 TEST(FileBasedWal, RollbackToZero) {
     // Force to make each file 1MB, each buffer is 1MB, and there are two
     // buffers at most
     FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
+    policy.fileSize = 1024L * 1024L;
+    policy.bufferSize = 1024L * 1024L;
     policy.numBuffers = 2;
 
     TempDir walDir("/tmp/testWal.XXXXXX");
-    // Create a new WAL, add one log and close it
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
@@ -387,19 +304,19 @@ TEST(FileBasedWal, RollbackToZero) {
     ASSERT_EQ(0, wal->lastLogId());
 }
 
+
 TEST(FileBasedWal, BackAndForth) {
     // Force to make each file 1MB, each buffer is 1MB, and there are two
     // buffers at most
     FileBasedWalPolicy policy;
-    policy.fileSize = 1;
-    policy.bufferSize = 1;
+    policy.fileSize = 1024L * 1024L;
+    policy.bufferSize = 1024L * 1024L;
     policy.numBuffers = 2;
 
     TempDir walDir("/tmp/testWal.XXXXXX");
-    // Create a new WAL, add one log and close it
     auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
                                     policy,
-                                    flusher.get(),
                                     [](LogID, TermID, ClusterID, const std::string&) {
                                         return true;
                                     });
@@ -415,7 +332,6 @@ TEST(FileBasedWal, BackAndForth) {
         ASSERT_EQ(100 * (count + 1), wal->lastLogId());
     }
 
-    // We don't delete the overlaping wals, there must be 10 wal files
     ASSERT_EQ(10, FileUtils::listAllFilesInDir(walDir.path(), false, "*.wal").size());
 
     // Rollback
@@ -424,6 +340,242 @@ TEST(FileBasedWal, BackAndForth) {
         ASSERT_EQ(i, wal->lastLogId());
     }
     ASSERT_EQ(0, FileUtils::listAllFilesInDir(walDir.path(), false, "*.wal").size());
+
+    for (int i = 1; i <= 10; i++) {
+        EXPECT_TRUE(
+            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+                           folly::stringPrintf("Test string %02d", i)));
+    }
+    ASSERT_EQ(1, FileUtils::listAllFilesInDir(walDir.path(), false, "*.wal").size());
+}
+
+
+TEST(FileBasedWal, TTLTest) {
+    TempDir walDir("/tmp/testWal.XXXXXX");
+    FileBasedWalPolicy policy;
+    policy.ttl = 3;
+    policy.bufferSize = 128;
+    policy.fileSize = 1024;
+    policy.numBuffers = 30;
+    auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
+                                    policy,
+                                    [](LogID, TermID, ClusterID, const std::string&) {
+                                        return true;
+                                    });
+    EXPECT_EQ(0, wal->lastLogId());
+
+    for (int i = 1; i <= 100; i++) {
+        EXPECT_TRUE(
+            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+                           folly::stringPrintf("Test string %02d", i)));
+    }
+    auto startIdAfterGC
+        = static_cast<FileBasedWal*>(wal.get())->walFiles_.rbegin()->second->firstId();
+    auto expiredFilesNum = static_cast<FileBasedWal*>(wal.get())->walFiles_.size() - 1;
+    sleep(policy.ttl + 1);
+    for (int i = 101; i <= 200; i++) {
+        EXPECT_TRUE(
+            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+                           folly::stringPrintf("Test string %02d", i)));
+    }
+    EXPECT_EQ(200, wal->lastLogId());
+    // Close the wal
+    wal.reset();
+
+    {
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(200, wal->lastLogId());
+
+        auto it = wal->iterator(1, 200);
+        LogID id = 1;
+        while (it->valid()) {
+            EXPECT_EQ(id, it->logId());
+            EXPECT_EQ(folly::stringPrintf("Test string %02ld", id),
+                      it->logMsg());
+            ++(*it);
+            ++id;
+        }
+        EXPECT_EQ(201, id);
+    }
+    auto totalFilesNum = static_cast<FileBasedWal*>(wal.get())->walFiles_.size();
+    wal->cleanWAL();
+    auto numFilesAfterGC = static_cast<FileBasedWal*>(wal.get())->walFiles_.size();
+    // We will hold the last expired file.
+    ASSERT_EQ(numFilesAfterGC, totalFilesNum - expiredFilesNum)
+            << "total " << totalFilesNum
+            << ", numFilesAfterGC " << numFilesAfterGC
+            << ", expiredFilesNum " << expiredFilesNum;
+
+    wal.reset();
+    {
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(200, wal->lastLogId());
+        EXPECT_EQ(startIdAfterGC, wal->firstLogId());
+        auto it = wal->iterator(startIdAfterGC, 200);
+        LogID id = startIdAfterGC;
+        while (it->valid()) {
+            EXPECT_EQ(id, it->logId());
+            EXPECT_EQ(folly::stringPrintf("Test string %02ld", id),
+                      it->logMsg());
+            ++(*it);
+            ++id;
+        }
+        EXPECT_EQ(201, id);
+    }
+}
+
+TEST(FileBasedWal, CheckLastWalTest) {
+    FileBasedWalPolicy policy;
+    policy.fileSize = 1024L * 1024L;
+    TempDir walDir("/tmp/testWal.XXXXXX");
+
+    auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
+                                    policy,
+                                    [](LogID, TermID, ClusterID, const std::string&) {
+                                        return true;
+                                    });
+    {
+        EXPECT_EQ(0, wal->lastLogId());
+
+        for (int i = 1; i <= 1000; i++) {
+            EXPECT_TRUE(
+                wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+                               folly::stringPrintf(kLongMsg, i)));
+        }
+        EXPECT_EQ(1000, wal->lastLogId());
+        wal.reset();
+    }
+    {
+        // Modify the wal file, make last wal invalid
+        std::vector<std::string> files = FileUtils::listAllFilesInDir(walDir.path(), true, "*.wal");
+        std::sort(files.begin(), files.end());
+        size_t size = FileUtils::fileSize(files.back().c_str());
+        auto fd = open(files.back().c_str(), O_WRONLY | O_APPEND);
+        if (ftruncate(fd, size - sizeof(int32_t)) < 0) {
+            LOG(ERROR) << "truncate failed";
+            close(fd);
+            return;
+        }
+        close(fd);
+
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(999, wal->lastLogId());
+    }
+    {
+        // get lastId in previous wal, make last wal invalid
+        std::vector<std::string> files = FileUtils::listAllFilesInDir(walDir.path(), true, "*.wal");
+        std::sort(files.begin(), files.end());
+        auto lastWalPath = files.back();
+        auto it = wal->walFiles_.rbegin();
+        it++;
+        auto expected = it->second->lastId();
+        wal.reset();
+
+        auto fd = open(lastWalPath.c_str(), O_WRONLY | O_APPEND);
+        if (ftruncate(fd, sizeof(LogID) + sizeof(TermID)) < 0) {
+            LOG(ERROR) << "truncate failed";
+            close(fd);
+            return;
+        }
+        close(fd);
+
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(expected, wal->lastLogId());
+        wal.reset();
+
+        // truncate last wal
+        fd = open(lastWalPath.c_str(), O_WRONLY | O_APPEND);
+        if (ftruncate(fd, 0) < 0) {
+            LOG(ERROR) << "truncate failed";
+            close(fd);
+            return;
+        }
+        close(fd);
+
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(expected, wal->lastLogId());
+
+        // Append more log, and reset to 1000, the last wal should be an empty file
+        for (int i = expected + 1; i <= expected + 1000; i++) {
+           EXPECT_TRUE(wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+               folly::stringPrintf(kLongMsg, i)));
+        }
+        EXPECT_EQ(expected + 1000, wal->lastLogId());
+
+        wal->rollbackToLog(1000);
+        ASSERT_EQ(1000, wal->lastLogId());
+        wal.reset();
+
+        // Now let's open it to read
+        wal = FileBasedWal::getWal(walDir.path(),
+                                   "",
+                                   policy,
+                                   [](LogID, TermID, ClusterID, const std::string&) {
+                                       return true;
+                                   });
+        EXPECT_EQ(1000, wal->lastLogId());
+    }
+}
+
+TEST(FileBasedWal, LinkTest) {
+    TempDir walDir("/tmp/testWal.XXXXXX");
+    FileBasedWalPolicy policy;
+    policy.fileSize = 1024 * 512;
+    auto wal = FileBasedWal::getWal(walDir.path(),
+                                    "",
+                                    policy,
+                                    [](LogID, TermID, ClusterID, const std::string&) {
+                                        return true;
+                                    });
+    EXPECT_EQ(0, wal->lastLogId());
+    for (int i = 1; i <= 1000; i++) {
+        EXPECT_TRUE(
+            wal->appendLog(i /*id*/, 1 /*term*/, 0 /*cluster*/,
+                           folly::stringPrintf(kLongMsg, i)));
+    }
+    auto snapshotFile = folly::stringPrintf("%s/snapshot", walDir.path());
+    CHECK(wal->linkCurrentWAL(snapshotFile.c_str()));
+    auto it = wal->walFiles_.rbegin();
+    auto files = fs::FileUtils::listAllFilesInDir(snapshotFile.data(), true);
+    ASSERT_EQ(1, files.size());
+    EXPECT_EQ(FileUtils::fileSize(it->second->path()), FileUtils::fileSize(files[0].c_str()));
+    auto num = wal->walFiles_.size();
+    EXPECT_TRUE(
+            wal->appendLog(1001 /*id*/, 1 /*term*/, 0 /*cluster*/,
+                           folly::stringPrintf(kLongMsg, 1001)));
+    EXPECT_EQ(num + 1, wal->walFiles_.size());
 }
 
 }  // namespace wal
@@ -434,9 +586,6 @@ int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     folly::init(&argc, &argv, true);
     google::SetStderrLogging(google::INFO);
-
-    using nebula::wal::flusher;
-    flusher.reset(new nebula::wal::BufferFlusher());
 
     return RUN_ALL_TESTS();
 }

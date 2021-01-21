@@ -13,6 +13,26 @@ namespace kvstore {
 
 constexpr auto kHeadLen = sizeof(int64_t) + 1 + sizeof(uint32_t);
 
+std::string encodeKV(const folly::StringPiece& key,
+                     const folly::StringPiece& val) {
+    uint32_t ksize = key.size();
+    uint32_t vsize = val.size();
+    std::string str;
+    str.reserve(sizeof(uint32_t) * 2 + ksize + vsize);
+    str.append(reinterpret_cast<const char*>(&ksize), sizeof(ksize));
+    str.append(reinterpret_cast<const char*>(&vsize), sizeof(vsize));
+    str.append(key.data(), ksize);
+    str.append(val.data(), vsize);
+    return str;
+}
+
+std::pair<folly::StringPiece, folly::StringPiece> decodeKV(const std::string& data) {
+    auto ksize = *reinterpret_cast<const uint32_t*>(data.data());
+    auto vsize = *reinterpret_cast<const uint32_t*>(data.data() + sizeof(ksize));
+    auto key = folly::StringPiece(data.data() + sizeof(ksize) + sizeof(vsize), ksize);
+    auto val = folly::StringPiece(data.data() + sizeof(ksize) + sizeof(vsize) + ksize, vsize);
+    return std::make_pair(key, val);
+}
 
 std::string encodeSingleValue(LogType type, folly::StringPiece val) {
     std::string encoded;
@@ -144,27 +164,83 @@ std::vector<folly::StringPiece> decodeMultiValues(folly::StringPiece encoded) {
     return values;
 }
 
-std::string encodeLearner(const HostAddr& learner) {
+std::string
+encodeBatchValue(const std::vector<std::tuple<BatchLogType, std::string, std::string>>& batch) {
+    auto type = LogType::OP_BATCH_WRITE;
     std::string encoded;
-    encoded.reserve(kHeadLen + sizeof(HostAddr));
+    encoded.reserve(1024);
+
     // Timestamp (8 bytes)
     int64_t ts = time::WallClock::fastNowInMilliSec();
     encoded.append(reinterpret_cast<char*>(&ts), sizeof(int64_t));
     // Log type
-    auto type = LogType::OP_ADD_LEARNER;
     encoded.append(reinterpret_cast<char*>(&type), 1);
-    encoded.append(reinterpret_cast<const char*>(&learner), sizeof(HostAddr));
+    // Number of values
+    auto num = static_cast<uint32_t>(batch.size());
+    encoded.append(reinterpret_cast<char*>(&num), sizeof(uint32_t));
+    // Values
+    for (auto& op : batch) {
+        auto opType = std::get<0>(op);
+        auto key = std::get<1>(op);
+        auto val = std::get<2>(op);
+        auto keySize = key.size();
+        auto valSize = val.size();
+        encoded.append(reinterpret_cast<char*>(&opType), 1)
+               .append(reinterpret_cast<char*>(&keySize), sizeof(uint32_t))
+               .append(key.data(), keySize)
+               .append(reinterpret_cast<char*>(&valSize), sizeof(uint32_t))
+               .append(val.data(), valSize);
+    }
+
     return encoded;
 }
 
-HostAddr decodeLearner(const std::string& encoded) {
+std::vector<std::pair<BatchLogType, std::pair<folly::StringPiece, folly::StringPiece>>>
+decodeBatchValue(folly::StringPiece encoded) {
+    // Skip the timestamp and the first type byte
+    auto* p = encoded.begin() + sizeof(int64_t) + 1;
+    uint32_t numValues = *(reinterpret_cast<const uint32_t*>(p));
+    p += sizeof(uint32_t);
+    std::vector<std::pair<BatchLogType, std::pair<folly::StringPiece, folly::StringPiece>>> batch;
+    for (auto i = 0U; i < numValues; i++) {
+        auto offset = 0;
+        BatchLogType type = *(reinterpret_cast<const BatchLogType *>(p));
+        p += sizeof(LogType);
+        uint32_t len1 = *(reinterpret_cast<const uint32_t*>(p));
+        offset += sizeof(uint32_t) + len1;
+        uint32_t len2 = *(reinterpret_cast<const uint32_t*>(p + offset));
+        offset += sizeof(uint32_t);
+        batch.emplace_back(type, std::pair<folly::StringPiece, folly::StringPiece>
+                (folly::StringPiece(p + sizeof(uint32_t), len1),
+                 folly::StringPiece(p + offset, len2)));
+        p += offset + len2;
+    }
+    return batch;
+}
+
+std::string encodeHost(LogType type, const HostAddr& host) {
+    std::string encoded;
+    encoded.reserve(sizeof(int64_t) + 1 + sizeof(HostAddr));
+    int64_t ts = time::WallClock::fastNowInMilliSec();
+    encoded.append(reinterpret_cast<char*>(&ts), sizeof(int64_t))
+           .append(reinterpret_cast<char*>(&type), 1)
+           .append(reinterpret_cast<const char*>(&host), sizeof(HostAddr));
+    return encoded;
+}
+
+HostAddr decodeHost(LogType type, const folly::StringPiece& encoded) {
     HostAddr addr;
-    CHECK_EQ(kHeadLen + sizeof(HostAddr), encoded.size());
-    memcpy(&addr.first, encoded.data() + kHeadLen, sizeof(addr.first));
+    CHECK_EQ(sizeof(int64_t) + 1 + sizeof(HostAddr), encoded.size());
+    CHECK(encoded[sizeof(int64_t)] == type);
+    memcpy(&addr.first, encoded.begin() + sizeof(int64_t) + 1, sizeof(addr.first));
     memcpy(&addr.second,
-           encoded.data() + kHeadLen + sizeof(addr.first),
+           encoded.begin() + sizeof(int64_t) + 1 + sizeof(addr.first),
            sizeof(addr.second));
     return addr;
+}
+
+int64_t getTimestamp(const folly::StringPiece& command) {
+    return *reinterpret_cast<const int64_t*>(command.begin());
 }
 
 }  // namespace kvstore

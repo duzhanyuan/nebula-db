@@ -14,27 +14,21 @@ namespace graph {
 
 
 AssignmentExecutor::AssignmentExecutor(Sentence *sentence,
-                                       ExecutionContext *ectx) : Executor(ectx) {
+                                       ExecutionContext *ectx)
+    : Executor(ectx, "assignment") {
     sentence_ = static_cast<AssignmentSentence*>(sentence);
 }
 
 
 Status AssignmentExecutor::prepare() {
-    auto status = checkIfGraphSpaceChosen();
-    if (!status.ok()) {
-        return status;
-    }
-
     var_ = sentence_->var();
     executor_ = TraverseExecutor::makeTraverseExecutor(sentence_->sentence(), ectx());
 
     auto onError = [this] (Status s) {
-        DCHECK(onError_);
-        onError_(std::move(s));
+        doError(std::move(s));
     };
-    auto onFinish = [this] () {
-        DCHECK(onFinish_);
-        onFinish_();
+    auto onFinish = [this] (Executor::ProcessControl ctr) {
+        doFinish(ctr);
     };
     auto onResult = [this] (std::unique_ptr<InterimResult> result) {
         ectx()->variableHolder()->add(*var_, std::move(result));
@@ -43,7 +37,7 @@ Status AssignmentExecutor::prepare() {
     executor_->setOnFinish(onFinish);
     executor_->setOnResult(onResult);
 
-    status = executor_->prepare();
+    auto status = executor_->prepare();
     if (!status.ok()) {
         FLOG_ERROR("Prepare executor `%s' failed: %s",
                     executor_->name(), status.toString().c_str());
@@ -55,6 +49,11 @@ Status AssignmentExecutor::prepare() {
 
 
 void AssignmentExecutor::execute() {
+    auto status = checkIfGraphSpaceChosen();
+    if (!status.ok()) {
+        doError(std::move(status));
+        return;
+    }
     executor_->execute();
 }
 

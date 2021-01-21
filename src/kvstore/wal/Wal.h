@@ -41,6 +41,17 @@ public:
     // Rollback to the given id, all logs after the id will be discarded
     virtual bool rollbackToLog(LogID id) = 0;
 
+    /**
+     * Create hard link for current wal on the new path.
+     * */
+    virtual bool linkCurrentWAL(const char* newPath) = 0;
+
+    // Clean all wal files
+    // This method is *NOT* thread safe
+    virtual bool reset() = 0;
+
+    virtual void cleanWAL(int32_t ttl = 0) = 0;
+
     // Scan [firstLogId, lastLogId]
     virtual std::unique_ptr<LogIterator> iterator(LogID firstLogId,
                                                   LogID lastLogId) = 0;

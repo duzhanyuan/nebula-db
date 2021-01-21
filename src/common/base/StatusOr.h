@@ -21,7 +21,7 @@ public:
 
     // Convenience type traits
     template <typename U>
-    static constexpr auto is_status_v = std::is_same<Status, std::decay_t<U>>::value;
+    static constexpr bool is_status_v = std::is_same<Status, std::decay_t<U>>::value;
 
     // Tell if `U' is of type `StatusOr<V>'
     template <typename U>
@@ -33,7 +33,7 @@ public:
     };
 
     template <typename U>
-    static constexpr auto is_status_or_v = is_status_or<U>::value;
+    static constexpr bool is_status_or_v = is_status_or<U>::value;
 
     // Tell if `T' is initializable from `U'.
     // We simply use `is_constructible_v' for now,
@@ -43,7 +43,8 @@ public:
     // TODO(dutor) we may take other cases into account in future,
     // e.g. convertible but not constructible.
     template <typename U>
-    static constexpr auto is_initializable_v = is_constructible_v<T, U> &&
+    static constexpr bool is_initializable_v = is_constructible_v<T, U> &&
+                                               std::is_convertible<U, T>::value &&
                                                !is_status_or_v<U> &&
                                                !is_status_v<U>;
 
@@ -82,9 +83,14 @@ public:
 
     // Copy/move construct with a value of any compatible type
     // Not explicit to allow construct from a value, e.g. in the `return' statement
-    template <typename U>
-    StatusOr(U &&value, std::enable_if_t<is_initializable_v<U>>* = nullptr)     // NOLINT
+    template <typename U, typename = std::enable_if_t<is_initializable_v<U>>>
+    StatusOr(U &&value)     // NOLINT
         : variant_(std::forward<U>(value)) {
+        state_ = kValue;
+    }
+
+    StatusOr(T &&value)     // NOLINT
+        : variant_(std::move(value)) {
         state_ = kValue;
     }
 

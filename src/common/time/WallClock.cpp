@@ -18,22 +18,10 @@ int64_t WallClock::slowNowInSec() {
 }
 
 
-int64_t WallClock::fastNowInSec() {
-    static const int64_t st = kStartTime.tv_sec;
-    return (readTsc() - kFirstTick) * ticksPerSecFactor + st;
-}
-
-
 int64_t WallClock::slowNowInMilliSec() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
-
-
-int64_t WallClock::fastNowInMilliSec() {
-    static const int64_t st = kStartTime.tv_sec * 1000 + kStartTime.tv_nsec / 1000000;
-    return (readTsc() - kFirstTick) * ticksPerMSecFactor + st;
 }
 
 
@@ -44,10 +32,37 @@ int64_t WallClock::slowNowInMicroSec() {
 }
 
 
-int64_t WallClock::fastNowInMicroSec() {
-    static const int64_t st = kStartTime.tv_sec * 1000000 + kStartTime.tv_nsec / 1000;
-    return (readTsc() - kFirstTick) * ticksPerUSecFactor + st;
+#if defined(__x86_64__)
+int64_t WallClock::fastNowInSec() {
+    return TscHelper::tickToTimePointInSec(TscHelper::readTsc());
 }
+
+
+int64_t WallClock::fastNowInMilliSec() {
+    return TscHelper::tickToTimePointInMSec(TscHelper::readTsc());
+}
+
+
+int64_t WallClock::fastNowInMicroSec() {
+    return TscHelper::tickToTimePointInUSec(TscHelper::readTsc());
+}
+#elif defined(__aarch64__) || defined(__arm64__)
+int64_t WallClock::fastNowInSec() {
+    return WallClock::slowNowInSec();
+}
+
+
+int64_t WallClock::fastNowInMilliSec() {
+    return slowNowInMilliSec();
+}
+
+
+int64_t WallClock::fastNowInMicroSec() {
+    return slowNowInMicroSec();
+}
+#else   // defined(__x86_64__)
+#error "Only x86_64 and aarch64 are supported"
+#endif  // defined(__x86_64__)
 
 }  // namespace time
 }  // namespace nebula

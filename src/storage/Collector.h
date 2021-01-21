@@ -21,6 +21,10 @@ public:
 
     virtual ~Collector() = default;
 
+    virtual void collectDstId(VertexID) {}
+
+    virtual void collectVid(int64_t v, const PropContext& prop) = 0;
+
     virtual void collectBool(bool v, const PropContext& prop) = 0;
 
     virtual void collectInt64(int64_t v, const PropContext& prop) = 0;
@@ -34,23 +38,35 @@ public:
 class PropsCollector : public Collector {
 public:
     explicit PropsCollector(RowWriter* writer)
-                : writer_(writer) {}
+        : writer_(writer) {}
 
+    void collectDstId(VertexID dstId) override {
+        dstId_ = dstId;
+    }
+
+    void collectVid(int64_t v, const PropContext& prop) override {
+        (*writer_) << v;
+        VLOG(3) << "collect vid: " << prop.prop_.name << ", value = " << v;
+    }
 
     void collectBool(bool v, const PropContext& prop) override {
-        collect<bool>(v, prop);
+        (*writer_) << v;
+        VLOG(3) << "collect bool: " << prop.prop_.name << ", value = " << v;
     }
 
     void collectInt64(int64_t v, const PropContext& prop) override {
-        collect<int64_t>(v, prop);
+        (*writer_) << v;
+        VLOG(3) << "collect int: " << prop.prop_.name << ", value = " << v;
     }
 
     void collectDouble(double v, const PropContext& prop) override {
-        collect<double>(v, prop);
+        (*writer_) << v;
+        VLOG(3) << "collect double: " << prop.prop_.name << ", value = " << v;
     }
 
     void collectString(const std::string& v, const PropContext& prop) override {
-        collect<const std::string>(v, prop);
+        (*writer_) << v;
+        VLOG(3) << "collect string: " << prop.prop_.name << ", value = " << v;
     }
 
     template<typename V>
@@ -58,14 +74,24 @@ public:
         (*writer_) << v;
     }
 
+    VertexID getDstId() const {
+        return dstId_;
+    }
+
 private:
-    RowWriter* writer_ = nullptr;
+    VertexID dstId_;
+    RowWriter* writer_;
 };
 
 
 class StatsCollector : public Collector {
 public:
     StatsCollector() = default;
+
+    void collectVid(int64_t v, const PropContext& prop) override {
+        UNUSED(v);
+        UNUSED(prop);
+    }
 
     void collectBool(bool, const PropContext& prop) override {
         std::lock_guard<std::mutex> lg(lock_);
@@ -96,4 +122,3 @@ private:
 }  // namespace storage
 }  // namespace nebula
 #endif  // STORAGE_COLLECTOR_H_
-

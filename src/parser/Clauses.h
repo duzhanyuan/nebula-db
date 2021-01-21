@@ -11,26 +11,86 @@
 
 namespace nebula {
 
-class StepClause final {
+class OverEdge;
+class Clause {
 public:
-    explicit StepClause(uint64_t steps = 1, bool isUpto = false) {
-        steps_ = steps;
-        isUpto_ = isUpto;
+    struct Vertices {
+        std::string             *colname_{nullptr};
+        std::string             *varname_{nullptr};
+        std::vector<VertexID>    vids_;
+    };
+
+    struct Over {
+        std::vector<OverEdge*>  edges_{nullptr};
+        std::vector<EdgeType>   edgeTypes_;
+        std::vector<EdgeType>   oppositeTypes_;
+    };
+
+    struct Step {
+        uint32_t recordFrom_;
+        uint32_t recordTo_;
+    };
+
+    struct Where {
+        Expression *filter_{nullptr};
+    };
+
+protected:
+    enum Kind : uint8_t {
+        kUnknown = 0,
+
+        kStepClause,
+        kOverClause,
+        kFromClause,
+        kToClause,
+        kWhereClause,
+        kYieldClause,
+
+        kMax,
+    };
+
+protected:
+    Kind    kind_{kUnknown};
+};
+
+class StepClause final : public Clause {
+public:
+    explicit StepClause(uint32_t recordTo = 1)  // Keep same with before
+        : step_({recordTo, recordTo}) {
+        // check range validation in parser
+        kind_ = Kind::kStepClause;
+    }
+
+    //  GO recoredFrom TO recordTo STEPS
+    // [recordFrom, recordTo]
+    explicit StepClause(uint32_t recordFrom, uint32_t recordTo)
+        : step_({recordFrom, recordTo}) {
+        // check range validation in parser
+        kind_ = Kind::kStepClause;
+    }
+
+    Status prepare(Step &step) const {
+        step.recordFrom_ = step_.recordFrom_;
+        step.recordTo_   = step_.recordTo_;
+        return Status::OK();
     }
 
     uint32_t steps() const {
-        return steps_;
+        return step_.recordTo_;
     }
 
-    bool isUpto() const {
-        return isUpto_;
+    uint32_t recordFrom() const {
+        return step_.recordFrom_;
+    }
+
+    uint32_t recordTo() const {
+        return step_.recordTo_;
     }
 
     std::string toString() const;
 
 private:
-    uint32_t                                    steps_{1};
-    bool                                        isUpto_{false};
+    Step step_;
 };
 
 
@@ -51,7 +111,6 @@ private:
 };
 
 
-
 class VertexIDList final {
 public:
     void add(Expression *expr) {
@@ -67,6 +126,33 @@ public:
         return result;
     }
 
+    void setContext(ExpressionContext *context) {
+        for (auto &expr : vidList_) {
+            expr->setContext(context);
+        }
+    }
+
+    Status prepare() const {
+        auto status = Status::OK();
+        for (auto& vertex : vidList_) {
+            status = vertex->prepare();
+            if (!status.ok()) {
+                break;
+            }
+        }
+        return status;
+    }
+
+    std::vector<nebula::OptVariantType> eval() const {
+        Getters getters;
+        std::vector<nebula::OptVariantType> vertices;
+        for (auto& vertex : vidList_) {
+            auto vid = vertex->eval(getters);
+            vertices.emplace_back(vid);
+        }
+        return vertices;
+    }
+
     std::string toString() const;
 
 private:
@@ -74,13 +160,13 @@ private:
 };
 
 
-class FromClause final {
+class VerticesClause : public Clause {
 public:
-    explicit FromClause(VertexIDList *vidList) {
+    explicit VerticesClause(VertexIDList *vidList) {
         vidList_.reset(vidList);
     }
 
-    explicit FromClause(Expression *ref) {
+    explicit VerticesClause(Expression *ref) {
         ref_.reset(ref);
     }
 
@@ -96,46 +182,131 @@ public:
         return ref_.get();
     }
 
-    std::string toString() const;
+    void setContext(ExpressionContext *context) {
+        expCtx_ = context;
+    }
 
-private:
+    Status prepare(Vertices &vertices) const;
+
+protected:
     std::unique_ptr<VertexIDList>               vidList_;
     std::unique_ptr<Expression>                 ref_;
+    ExpressionContext                          *expCtx_{nullptr};
 };
 
-
-class OverClause final {
+class FromClause final : public VerticesClause {
 public:
-    explicit OverClause(std::string *edge,
-                        std::string *alias = nullptr,
-                        bool isReversely = false) {
+    explicit FromClause(VertexIDList *vidList) : VerticesClause(vidList) {
+        kind_ = kFromClause;
+    }
+
+    explicit FromClause(Expression *ref) : VerticesClause(ref) {
+        kind_ = kFromClause;
+    }
+
+    std::string toString() const;
+};
+
+class ToClause final : public VerticesClause {
+public:
+    explicit ToClause(VertexIDList *vidList) : VerticesClause(vidList) {
+        kind_ = kToClause;
+    }
+
+    explicit ToClause(Expression *ref) : VerticesClause(ref) {
+        kind_ = kToClause;
+    }
+
+    std::string toString() const;
+};
+
+class OverEdge final {
+public:
+    explicit OverEdge(std::string *edge, std::string *alias = nullptr) {
         edge_.reset(edge);
         alias_.reset(alias);
-        isReversely_ = isReversely;
     }
 
-    bool isReversely() const {
-        return isReversely_;
-    }
+    bool isOverAll() const { return *edge_ == "*"; }
 
-    std::string* edge() const {
-        return edge_.get();
-    }
+    std::string *edge() const { return edge_.get(); }
 
-    std::string* alias() const {
-        return alias_.get();
+    std::string *alias() const { return alias_.get(); }
+
+    std::string toString() const;
+
+private:
+    std::unique_ptr<std::string> edge_;
+    std::unique_ptr<std::string> alias_;
+};
+
+class OverEdges final {
+public:
+    void addEdge(OverEdge *edge) { edges_.emplace_back(edge); }
+
+    std::vector<OverEdge *> edges() {
+        std::vector<OverEdge *> result;
+
+        std::transform(edges_.cbegin(), edges_.cend(),
+                       std::insert_iterator<std::vector<OverEdge *>>(result, result.begin()),
+                       [](auto &edge) { return edge.get(); });
+        return result;
     }
 
     std::string toString() const;
 
 private:
-    bool                                        isReversely_{false};
-    std::unique_ptr<std::string>                edge_;
-    std::unique_ptr<std::string>                alias_;
+    std::vector<std::unique_ptr<OverEdge>> edges_;
 };
 
+class FetchLabels final {
+public:
+    void addLabel(std::string *label) { labels_.emplace_back(label); }
 
-class WhereClause final {
+    std::vector<std::string *> labels() {
+        std::vector<std::string *> result;
+        std::transform(labels_.cbegin(), labels_.cend(),
+                       std::insert_iterator<std::vector<std::string *>>(result, result.begin()),
+                       [](auto &label) { return label.get(); });
+        return result;
+    }
+
+    std::string toString() const;
+private:
+    std::vector<std::unique_ptr<std::string>> labels_;
+};
+
+class OverClause final : public Clause {
+public:
+    enum class Direction : uint8_t {
+        kForward,
+        kBackward,
+        kBidirect
+    };
+
+    OverClause(OverEdges *edges,
+               Direction direction = Direction::kForward) {
+        kind_ = kOverClause;
+        overEdges_.reset(edges);
+        direction_ = direction;
+    }
+
+    std::vector<OverEdge *> edges() const { return overEdges_->edges(); }
+
+    Status prepare(Over &over) const;
+
+    std::string toString() const;
+
+    Direction direction() const {
+        return direction_;
+    }
+
+private:
+    Direction                  direction_;
+    std::unique_ptr<OverEdges> overEdges_;
+};
+
+class WhereClause final : public Clause {
 public:
     explicit WhereClause(Expression *filter) {
         filter_.reset(filter);
@@ -145,12 +316,15 @@ public:
         return filter_.get();
     }
 
+    Status prepare(Where &where) const;
+
     std::string toString() const;
 
 private:
     std::unique_ptr<Expression>                 filter_;
 };
 
+using WhenClause = WhereClause;
 
 class YieldColumn final {
 public:
@@ -167,9 +341,26 @@ public:
         return alias_.get();
     }
 
+    void setFunction(std::string* fun = nullptr) {
+        if (fun == nullptr) {
+            return;
+        }
+        funName_.reset(fun);
+    }
+
+    std::string getFunName() {
+        if (funName_ == nullptr) {
+            return "";
+        }
+        return *funName_;
+    }
+
+    std::string toString() const;
+
 private:
     std::unique_ptr<Expression>                 expr_;
     std::unique_ptr<std::string>                alias_;
+    std::unique_ptr<std::string>                funName_{nullptr};
 };
 
 
@@ -214,8 +405,27 @@ public:
 private:
     std::unique_ptr<YieldColumns>               yieldColumns_;
     bool                                        distinct_;
+    // this member will hold the reference
+    // which is expand by *
+    std::unique_ptr<YieldColumns>               yieldColHolder_;
 };
 
-}   // namespace nebula
+class GroupClause final {
+public:
+    explicit GroupClause(YieldColumns *fields) {
+        groupColumns_.reset(fields);
+    }
 
+    std::vector<YieldColumn*> columns() const {
+        return groupColumns_->columns();
+    }
+
+
+    std::string toString() const;
+
+private:
+    std::unique_ptr<YieldColumns>               groupColumns_;
+};
+}   // namespace nebula
 #endif  // PARSER_CLAUSES_H_
+

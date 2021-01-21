@@ -18,10 +18,7 @@ public:
     CliManager();
     ~CliManager() = default;
 
-    bool connect(const std::string& addr,
-                 uint16_t port,
-                 const std::string& username,
-                 const std::string& password);
+    bool connect();
 
     void batch(const std::string& filename);
 
@@ -42,7 +39,6 @@ private:
     std::string addr_;
     uint16_t port_;
     std::string username_;
-    std::string curSpaceName_;
     bool enableHistroy_{true};
     bool isInteractive_{true};
 

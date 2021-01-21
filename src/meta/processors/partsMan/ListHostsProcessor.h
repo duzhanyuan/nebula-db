@@ -25,9 +25,19 @@ private:
             : BaseProcessor<cpp2::ListHostsResp>(kvstore) {}
 
     /**
-     * Get all hosts with online/offline status.
+     * Get all hosts with online/offline status and partition distribution.
      * */
-    StatusOr<std::vector<cpp2::HostItem>> allHostsWithStatus();
+    Status allHostsWithStatus();
+
+    // Get map of spaceId -> spaceName
+    Status getSpaceIdNameMap();
+
+    std::unordered_map<std::string, std::vector<PartitionID>>
+    getLeaderPartsWithSpaceName(const LeaderParts& leaderParts);
+
+    std::vector<GraphSpaceID> spaceIds_;
+    std::unordered_map<GraphSpaceID, std::string> spaceIdNameMap_;
+    std::vector<cpp2::HostItem> hostItems_;
 };
 
 }  // namespace meta

@@ -24,6 +24,7 @@ namespace raftex {
 class RaftPart;
 
 class Host final : public std::enable_shared_from_this<Host> {
+    friend class RaftPart;
 public:
     Host(const HostAddr& addr, std::shared_ptr<RaftPart> part, bool isLearner = false);
 
@@ -52,14 +53,31 @@ public:
         stopped_ = true;
     }
 
+    void reset() {
+        std::unique_lock<std::mutex> g(lock_);
+        noMoreRequestCV_.wait(g, [this] { return !requestOnGoing_; });
+        logIdToSend_ = 0;
+        logTermToSend_ = 0;
+        lastLogIdSent_ = 0;
+        lastLogTermSent_ = 0;
+        committedLogId_ = 0;
+        sendingSnapshot_ = false;
+        followerCommittedLogId_ = 0;
+    }
+
     void waitForStop();
 
     bool isLearner() const {
         return isLearner_;
     }
 
+    void setLearner(bool isLearner) {
+        isLearner_ = isLearner;
+    }
+
     folly::Future<cpp2::AskForVoteResponse> askForVote(
-        const cpp2::AskForVoteRequest& req);
+        const cpp2::AskForVoteRequest& req,
+        folly::EventBase* eb);
 
     // When logId == lastLogIdSent, it is a heartbeat
     folly::Future<cpp2::AppendLogResponse> appendLogs(
@@ -85,7 +103,7 @@ private:
         folly::EventBase* eb,
         std::shared_ptr<cpp2::AppendLogRequest> req);
 
-    std::shared_ptr<cpp2::AppendLogRequest> prepareAppendLogRequest() const;
+    std::shared_ptr<cpp2::AppendLogRequest> prepareAppendLogRequest();
 
     bool noRequest() const;
 
@@ -97,8 +115,8 @@ private:
     }
 
 private:
-    // <term, logId, committedLogId, lastLogTermSent, lastLogIdSent>
-    using Request = std::tuple<TermID, LogID, LogID, TermID, LogID>;
+    // <term, logId, committedLogId>
+    using Request = std::tuple<TermID, LogID, LogID>;
 
     std::shared_ptr<RaftPart> part_;
     const HostAddr addr_;
@@ -115,7 +133,7 @@ private:
     folly::SharedPromise<cpp2::AppendLogResponse> promise_;
     folly::SharedPromise<cpp2::AppendLogResponse> cachingPromise_;
 
-    Request pendingReq_{0, 0, 0, 0, 0};
+    Request pendingReq_{0, 0, 0};
 
     // These logId and term pointing to the latest log we need to send
     LogID logIdToSend_{0};
@@ -126,6 +144,10 @@ private:
     TermID lastLogTermSent_{0};
 
     LogID committedLogId_{0};
+    std::atomic_bool sendingSnapshot_{false};
+
+    // CommittedLogId of follower
+    LogID followerCommittedLogId_{0};
 };
 
 }  // namespace raftex

@@ -11,14 +11,19 @@
 #include <mutex>
 #include "interface/gen-cpp2/MetaService.h"
 #include "kvstore/KVStore.h"
+#include "meta/processors/admin/AdminClient.h"
+#include "stats/Stats.h"
 
 namespace nebula {
 namespace meta {
 
 class MetaServiceHandler final : public cpp2::MetaServiceSvIf {
 public:
-    explicit MetaServiceHandler(kvstore::KVStore* kv)
-                : kvstore_(kv) {}
+    explicit MetaServiceHandler(kvstore::KVStore* kv, ClusterID clusterId = 0)
+        : kvstore_(kv), clusterId_(clusterId) {
+        adminClient_ = std::make_unique<AdminClient>(kvstore_);
+        heartBeatStat_ = stats::Stats("meta", "heartbeat");
+    }
 
     /**
      * Parts distribution related operations.
@@ -35,14 +40,11 @@ public:
     folly::Future<cpp2::GetSpaceResp>
     future_getSpace(const cpp2::GetSpaceReq& req) override;
 
-    folly::Future<cpp2::ExecResp>
-    future_addHosts(const cpp2::AddHostsReq& req) override;
-
     folly::Future<cpp2::ListHostsResp>
     future_listHosts(const cpp2::ListHostsReq& req) override;
 
-    folly::Future<cpp2::ExecResp>
-    future_removeHosts(const cpp2::RemoveHostsReq& req) override;
+    folly::Future<cpp2::ListPartsResp>
+    future_listParts(const cpp2::ListPartsReq& req) override;
 
     folly::Future<cpp2::GetPartsAllocResp>
     future_getPartsAlloc(const cpp2::GetPartsAllocReq& req) override;
@@ -102,6 +104,45 @@ public:
     future_listEdges(const cpp2::ListEdgesReq& req) override;
 
     /**
+     * Index related operations.
+     * */
+    folly::Future<cpp2::ExecResp>
+    future_createTagIndex(const cpp2::CreateTagIndexReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_dropTagIndex(const cpp2::DropTagIndexReq& req) override;
+
+    folly::Future<cpp2::GetTagIndexResp>
+    future_getTagIndex(const cpp2::GetTagIndexReq &req) override;
+
+    folly::Future<cpp2::ListTagIndexesResp>
+    future_listTagIndexes(const cpp2::ListTagIndexesReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_rebuildTagIndex(const cpp2::RebuildIndexReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_createEdgeIndex(const cpp2::CreateEdgeIndexReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_dropEdgeIndex(const cpp2::DropEdgeIndexReq& req) override;
+
+    folly::Future<cpp2::GetEdgeIndexResp>
+    future_getEdgeIndex(const cpp2::GetEdgeIndexReq& req) override;
+
+    folly::Future<cpp2::ListEdgeIndexesResp>
+    future_listEdgeIndexes(const cpp2::ListEdgeIndexesReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_rebuildEdgeIndex(const cpp2::RebuildIndexReq& req) override;
+
+    folly::Future<cpp2::ListIndexStatusResp>
+    future_listTagIndexStatus(const cpp2::ListIndexStatusReq& req) override;
+
+    folly::Future<cpp2::ListIndexStatusResp>
+    future_listEdgeIndexStatus(const cpp2::ListIndexStatusReq& req) override;
+
+    /**
      * User manager
      **/
     folly::Future<cpp2::ExecResp>
@@ -119,9 +160,6 @@ public:
     folly::Future<cpp2::ExecResp>
     future_revokeRole(const cpp2::RevokeRoleReq& req) override;
 
-    folly::Future<cpp2::GetUserResp>
-    future_getUser(const cpp2::GetUserReq& req) override;
-
     folly::Future<cpp2::ListUsersResp>
     future_listUsers(const cpp2::ListUsersReq& req) override;
 
@@ -131,8 +169,8 @@ public:
     folly::Future<cpp2::ExecResp>
     future_changePassword(const cpp2::ChangePasswordReq& req) override;
 
-    folly::Future<cpp2::ExecResp>
-    future_checkPassword(const cpp2::CheckPasswordReq& req) override;
+    folly::Future<cpp2::ListRolesResp>
+    future_getUserRoles(const cpp2::GetUserRolesReq& req) override;
 
     /**
      * HeartBeat
@@ -142,6 +180,9 @@ public:
 
     folly::Future<cpp2::BalanceResp>
     future_balance(const cpp2::BalanceReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_leaderBalance(const cpp2::LeaderBalanceReq& req) override;
 
     folly::Future<cpp2::ExecResp>
     future_regConfig(const cpp2::RegConfigReq &req) override;
@@ -155,8 +196,23 @@ public:
     folly::Future<cpp2::ListConfigsResp>
     future_listConfigs(const cpp2::ListConfigsReq &req) override;
 
+    folly::Future<cpp2::ExecResp>
+    future_createSnapshot(const cpp2::CreateSnapshotReq& req) override;
+
+    folly::Future<cpp2::ExecResp>
+    future_dropSnapshot(const cpp2::DropSnapshotReq& req) override;
+
+    folly::Future<cpp2::ListSnapshotsResp>
+    future_listSnapshots(const cpp2::ListSnapshotsReq& req) override;
+
+    folly::Future<cpp2::AdminJobResp>
+    future_runAdminJob(const cpp2::AdminJobReq& req) override;
+
 private:
     kvstore::KVStore* kvstore_ = nullptr;
+    ClusterID clusterId_{0};
+    std::unique_ptr<AdminClient> adminClient_;
+    stats::Stats heartBeatStat_;
 };
 
 }  // namespace meta

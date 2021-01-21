@@ -1,20 +1,39 @@
 nebula_add_library(
     storage_service_handler OBJECT
     StorageServiceHandler.cpp
-    QueryBaseProcessor.cpp
-    AddVerticesProcessor.cpp
-    AddEdgesProcessor.cpp
-    QueryBoundProcessor.cpp
-    QueryVertexPropsProcessor.cpp
-    QueryEdgePropsProcessor.cpp
-    QueryStatsProcessor.cpp
+    StorageFlags.cpp
+    CommonUtils.cpp
+    query/QueryBaseProcessor.cpp
+    query/QueryBoundProcessor.cpp
+    query/QueryVertexPropsProcessor.cpp
+    query/QueryEdgePropsProcessor.cpp
+    query/QueryStatsProcessor.cpp
+    query/ScanEdgeProcessor.cpp
+    query/ScanVertexProcessor.cpp
+    mutate/AddVerticesProcessor.cpp
+    mutate/AddEdgesProcessor.cpp
+    mutate/DeleteEdgesProcessor.cpp
+    mutate/DeleteVerticesProcessor.cpp
+    mutate/UpdateVertexProcessor.cpp
+    mutate/UpdateEdgeProcessor.cpp
+    kv/PutProcessor.cpp
+    kv/GetProcessor.cpp
+    admin/CreateCheckpointProcessor.cpp
+    admin/DropCheckpointProcessor.cpp
+    admin/SendBlockSignProcessor.cpp
+    admin/RebuildTagIndexProcessor.cpp
+    admin/RebuildEdgeIndexProcessor.cpp
+    index/IndexPolicyMaker.cpp
+    index/IndexExecutor.cpp
+    index/LookUpIndexProcessor.cpp
 )
 
 nebula_add_library(
     storage_http_handler OBJECT
-    StorageHttpStatusHandler.cpp
-    StorageHttpDownloadHandler.cpp
-    StorageHttpAdminHandler.cpp
+    http/StorageHttpIngestHandler.cpp
+    http/StorageHttpDownloadHandler.cpp
+    http/StorageHttpAdminHandler.cpp
+    http/StorageHttpStatsHandler.cpp
 )
 
 nebula_add_library(
@@ -22,4 +41,9 @@ nebula_add_library(
     client/StorageClient.cpp
 )
 
-add_subdirectory(test)
+nebula_add_library(
+    storage_server OBJECT
+    StorageServer.cpp
+)
+
+nebula_add_subdirectory(test)

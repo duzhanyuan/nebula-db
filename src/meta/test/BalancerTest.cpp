@@ -5,7 +5,6 @@
  */
 #include "base/Base.h"
 #include <gtest/gtest.h>
-#include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/synchronization/Baton.h>
 #include "meta/processors/admin/Balancer.h"
 #include "meta/test/TestUtils.h"
@@ -13,72 +12,32 @@
 #include "meta/processors/partsMan/CreateSpaceProcessor.h"
 
 DECLARE_uint32(task_concurrency);
+DECLARE_int32(expired_threshold_sec);
+DECLARE_double(leader_balance_deviation);
 
 namespace nebula {
 namespace meta {
 
-class TestFaultInjector : public FaultInjector {
+class TestFaultInjectorWithSleep : public TestFaultInjector {
 public:
-    explicit TestFaultInjector(std::vector<Status> sts)
-        : statusArray_(std::move(sts)) {
-        executor_.reset(new folly::CPUThreadPoolExecutor(1));
-    }
-
-    ~TestFaultInjector() {
-    }
-
-    folly::Future<Status> response(int index) {
-        folly::Promise<Status> pro;
-        auto f = pro.getFuture();
-        executor_->add([this, p = std::move(pro), index]() mutable {
-            p.setValue(this->statusArray_[index]);
-        });
-        return f;
-    }
-
-    folly::Future<Status> transLeader() override {
-        return response(0);
-    }
-
-    folly::Future<Status> addPart() override {
-        return response(1);
-    }
-
-    folly::Future<Status> addLearner() override {
-        return response(2);
-    }
+    explicit TestFaultInjectorWithSleep(std::vector<Status> sts)
+        : TestFaultInjector(std::move(sts)) {}
 
     folly::Future<Status> waitingForCatchUpData() override {
+        sleep(3);
         return response(3);
     }
-
-    folly::Future<Status> memberChange() override {
-        return response(4);
-    }
-
-    folly::Future<Status> updateMeta() override {
-        return response(5);
-    }
-
-    folly::Future<Status> removePart() override {
-        return response(6);
-    }
-
-    void reset(std::vector<Status> sts) {
-        statusArray_ = std::move(sts);
-    }
-
-private:
-    std::vector<Status> statusArray_;
-    std::unique_ptr<folly::Executor> executor_;
 };
 
 TEST(BalanceTaskTest, SimpleTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}});
     {
-        std::vector<Status> sts(7, Status::OK());
+        std::vector<Status> sts(9, Status::OK());
         std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
         auto client = std::make_unique<AdminClient>(std::move(injector));
-        BalanceTask task(0, 0, 0, HostAddr(0, 0), HostAddr(1, 1), nullptr, nullptr);
+        BalanceTask task(0, 0, 0, HostAddr(0, 0), HostAddr(1, 1), kv.get(), client.get());
         folly::Baton<true, std::atomic> b;
         task.onFinished_ = [&]() {
             LOG(INFO) << "Task finished!";
@@ -89,7 +48,6 @@ TEST(BalanceTaskTest, SimpleTest) {
         task.onError_ = []() {
             LOG(FATAL) << "We should not reach here!";
         };
-        task.client_ = client.get();
         task.invoke();
         b.wait();
     }
@@ -100,10 +58,12 @@ TEST(BalanceTaskTest, SimpleTest) {
                                 Status::OK(),
                                 Status::OK(),
                                 Status::OK(),
+                                Status::OK(),
+                                Status::OK(),
                                 Status::OK()};
         std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
         auto client = std::make_unique<AdminClient>(std::move(injector));
-        BalanceTask task(0, 0, 0, HostAddr(0, 0), HostAddr(1, 1), nullptr, nullptr);
+        BalanceTask task(0, 0, 0, HostAddr(0, 0), HostAddr(1, 1), kv.get(), client.get());
         folly::Baton<true, std::atomic> b;
         task.onFinished_ = []() {
             LOG(FATAL) << "We should not reach here!";
@@ -114,7 +74,6 @@ TEST(BalanceTaskTest, SimpleTest) {
             EXPECT_EQ(BalanceTask::Status::CHANGE_LEADER, task.status_);
             b.post();
         };
-        task.client_ = client.get();
         task.invoke();
         b.wait();
     }
@@ -122,7 +81,7 @@ TEST(BalanceTaskTest, SimpleTest) {
 }
 
 TEST(BalanceTest, BalancePartsTest) {
-    auto* balancer = Balancer::instance(nullptr);
+    std::unique_ptr<Balancer> balancer(new Balancer(nullptr, nullptr));
     auto dump = [](const std::unordered_map<HostAddr, std::vector<PartitionID>>& hostParts,
                    const std::vector<BalanceTask>& tasks) {
         for (auto it = hostParts.begin(); it != hostParts.end(); it++) {
@@ -291,16 +250,23 @@ TEST(BalanceTest, DispatchTasksTest) {
 }
 
 TEST(BalanceTest, BalancePlanTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    std::vector<HostAddr> hosts;
+    for (int i = 0; i < 10; i++) {
+        hosts.emplace_back(i, 0);
+        hosts.emplace_back(i, 1);
+    }
     {
         LOG(INFO) << "Test with all tasks succeeded, only one bucket!";
-        BalancePlan plan(0L, nullptr, nullptr);
-        std::vector<Status> sts(7, Status::OK());
+        std::vector<Status> sts(9, Status::OK());
         std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
         auto client = std::make_unique<AdminClient>(std::move(injector));
+        BalancePlan plan(0L, kv.get(), client.get());
+        TestUtils::registerHB(kv.get(), hosts);
 
         for (int i = 0; i < 10; i++) {
-            BalanceTask task(0, 0, 0, HostAddr(i, 0), HostAddr(i, 1), nullptr, nullptr);
-            task.client_ = client.get();
+            BalanceTask task(0, 0, 0, HostAddr(i, 0), HostAddr(i, 1), kv.get(), client.get());
             plan.addTask(std::move(task));
         }
         folly::Baton<true, std::atomic> b;
@@ -318,14 +284,14 @@ TEST(BalanceTest, BalancePlanTest) {
     }
     {
         LOG(INFO) << "Test with all tasks succeeded, 10 buckets!";
-        BalancePlan plan(0L, nullptr, nullptr);
-        std::vector<Status> sts(7, Status::OK());
+        std::vector<Status> sts(9, Status::OK());
         std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
         auto client = std::make_unique<AdminClient>(std::move(injector));
+        BalancePlan plan(0L, kv.get(), client.get());
+        TestUtils::registerHB(kv.get(), hosts);
 
         for (int i = 0; i < 10; i++) {
-            BalanceTask task(0, 0, i, HostAddr(i, 0), HostAddr(i, 1), nullptr, nullptr);
-            task.client_ = client.get();
+            BalanceTask task(0, 0, i, HostAddr(i, 0), HostAddr(i, 1), kv.get(), client.get());
             plan.addTask(std::move(task));
         }
         folly::Baton<true, std::atomic> b;
@@ -348,12 +314,11 @@ TEST(BalanceTest, BalancePlanTest) {
         BalancePlan plan(0L, nullptr, nullptr);
         std::unique_ptr<AdminClient> client1, client2;
         {
-            std::vector<Status> sts(7, Status::OK());
+            std::vector<Status> sts(9, Status::OK());
             std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
             client1 = std::make_unique<AdminClient>(std::move(injector));
             for (int i = 0; i < 9; i++) {
-                BalanceTask task(0, 0, i, HostAddr(i, 0), HostAddr(i, 1), nullptr, nullptr);
-                task.client_ = client1.get();
+                BalanceTask task(0, 0, i, HostAddr(i, 0), HostAddr(i, 1), kv.get(), client1.get());
                 plan.addTask(std::move(task));
             }
         }
@@ -365,13 +330,15 @@ TEST(BalanceTest, BalancePlanTest) {
                                 Status::OK(),
                                 Status::OK(),
                                 Status::OK(),
+                                Status::OK(),
+                                Status::OK(),
                                 Status::OK()};
             std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
             client2 = std::make_unique<AdminClient>(std::move(injector));
-            BalanceTask task(0, 0, 0, HostAddr(10, 0), HostAddr(10, 1), nullptr, nullptr);
-            task.client_ = client2.get();
+            BalanceTask task(0, 0, 9, HostAddr(9, 0), HostAddr(9, 1), kv.get(), client2.get());
             plan.addTask(std::move(task));
         }
+        TestUtils::registerHB(kv.get(), hosts);
         folly::Baton<true, std::atomic> b;
         plan.onFinished_ = [&plan, &b] () {
             ASSERT_EQ(BalancePlan::Status::FAILED, plan.status_);
@@ -386,7 +353,6 @@ TEST(BalanceTest, BalancePlanTest) {
 TEST(BalanceTest, NormalTest) {
     fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
     std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
-    FLAGS_expired_hosts_check_interval_sec = 1;
     FLAGS_expired_threshold_sec = 1;
     TestUtils::createSomeHosts(kv.get());
     {
@@ -403,19 +369,19 @@ TEST(BalanceTest, NormalTest) {
         ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
         ASSERT_EQ(1, resp.get_id().get_space_id());
     }
-    std::vector<Status> sts(7, Status::OK());
+    std::vector<Status> sts(9, Status::OK());
     std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
     auto client = std::make_unique<AdminClient>(std::move(injector));
     Balancer balancer(kv.get(), std::move(client));
     auto ret = balancer.balance();
-    CHECK_EQ(Status::Error("No tasks"), ret.status());
+    ASSERT_EQ(cpp2::ErrorCode::E_BALANCED, error(ret));
 
     sleep(1);
     LOG(INFO) << "Now, we lost host " << HostAddr(3, 3);
-    TestUtils::registerHB({{0, 0}, {1, 1}, {2, 2}});
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
     ret = balancer.balance();
-    CHECK(ret.ok());
-    auto balanceId = ret.value();
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
     sleep(1);
     LOG(INFO) << "Rebalance finished!";
     {
@@ -469,10 +435,375 @@ TEST(BalanceTest, NormalTest) {
     }
 }
 
+TEST(BalanceTest, SpecifyHostTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 1;
+    TestUtils::createSomeHosts(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}});
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(8);
+        properties.set_replica_factor(3);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+    Balancer balancer(kv.get(), std::move(client));
+
+    sleep(1);
+    LOG(INFO) << "Now, we remove host {3, 3}";
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}});
+    auto ret = balancer.balance({{3, 3}});
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
+    sleep(1);
+    LOG(INFO) << "Rebalance finished!";
+    {
+        const auto& prefix = BalancePlan::prefix();
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int num = 0;
+        while (iter->valid()) {
+            auto id = BalancePlan::id(iter->key());
+            auto status = BalancePlan::status(iter->val());
+            ASSERT_EQ(balanceId, id);
+            ASSERT_EQ(BalancePlan::Status::SUCCEEDED, status);
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(1, num);
+    }
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t num = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            {
+                auto tup = BalanceTask::parseKey(iter->key());
+                task.balanceId_ = std::get<0>(tup);
+                ASSERT_EQ(balanceId, task.balanceId_);
+                task.spaceId_ = std::get<1>(tup);
+                ASSERT_EQ(1, task.spaceId_);
+                task.src_ = std::get<3>(tup);
+                ASSERT_EQ(HostAddr(3, 3), task.src_);
+            }
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                ASSERT_EQ(BalanceTask::Status::END, task.status_);
+                task.ret_ = std::get<1>(tup);
+                ASSERT_EQ(BalanceTask::Result::SUCCEEDED, task.ret_);
+                task.startTimeMs_ = std::get<2>(tup);
+                ASSERT_GT(task.startTimeMs_, 0);
+                task.endTimeMs_ = std::get<3>(tup);
+                ASSERT_GT(task.endTimeMs_, 0);
+            }
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(6, num);
+    }
+}
+
+TEST(BalanceTest, SpecifyMultiHostTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 1;
+    TestUtils::createSomeHosts(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(12);
+        properties.set_replica_factor(3);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+    std::unordered_map<HostAddr, int32_t> partCount;
+    for (int32_t i = 0; i < 6; i++) {
+        partCount[HostAddr(i, i)] = 6;
+    }
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+    Balancer balancer(kv.get(), std::move(client));
+
+    sleep(1);
+    LOG(INFO) << "Now, we want to remove host {2, 2}/{3, 3}";
+    // If {2, 2} and {3, 3} are both dead, minority hosts for some part are alive,
+    // it would lead to a fail
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {4, 4}, {5, 5}});
+    auto ret = balancer.balance({{2, 2}, {3, 3}});
+    CHECK(!ok(ret));
+    EXPECT_EQ(cpp2::ErrorCode::E_NO_VALID_HOST, error(ret));
+    // If {2, 2} is dead, {3, 3} stiil alive, each part has majority hosts alive
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {3, 3}, {4, 4}, {5, 5}});
+    ret = balancer.balance({{2, 2}, {3, 3}});
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
+    sleep(1);
+    LOG(INFO) << "Rebalance finished!";
+    {
+        const auto& prefix = BalancePlan::prefix();
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int num = 0;
+        while (iter->valid()) {
+            auto id = BalancePlan::id(iter->key());
+            auto status = BalancePlan::status(iter->val());
+            ASSERT_EQ(balanceId, id);
+            ASSERT_EQ(BalancePlan::Status::SUCCEEDED, status);
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(1, num);
+    }
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t num = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            {
+                auto tup = BalanceTask::parseKey(iter->key());
+                task.balanceId_ = std::get<0>(tup);
+                ASSERT_EQ(balanceId, task.balanceId_);
+                task.spaceId_ = std::get<1>(tup);
+                ASSERT_EQ(1, task.spaceId_);
+                task.src_ = std::get<3>(tup);
+                task.dst_ = std::get<4>(tup);
+                partCount[task.src_]--;
+                partCount[task.dst_]++;
+            }
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                ASSERT_EQ(BalanceTask::Status::END, task.status_);
+                task.ret_ = std::get<1>(tup);
+                ASSERT_EQ(BalanceTask::Result::SUCCEEDED, task.ret_);
+                task.startTimeMs_ = std::get<2>(tup);
+                ASSERT_GT(task.startTimeMs_, 0);
+                task.endTimeMs_ = std::get<3>(tup);
+                ASSERT_GT(task.endTimeMs_, 0);
+            }
+            num++;
+            iter->next();
+        }
+    }
+    ASSERT_EQ(9, partCount[HostAddr(0, 0)]);
+    ASSERT_EQ(9, partCount[HostAddr(1, 1)]);
+    ASSERT_EQ(0, partCount[HostAddr(2, 2)]);
+    ASSERT_EQ(0, partCount[HostAddr(3, 3)]);
+    ASSERT_EQ(9, partCount[HostAddr(4, 4)]);
+    ASSERT_EQ(9, partCount[HostAddr(5, 5)]);
+}
+
+TEST(BalanceTest, MockReplaceMachineTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 1;
+    TestUtils::createSomeHosts(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(12);
+        properties.set_replica_factor(3);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+    Balancer balancer(kv.get(), std::move(client));
+
+    TestUtils::createSomeHosts(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}});
+    LOG(INFO) << "Now, we want to replace host {2, 2} with {3, 3}";
+    // Because for all parts majority hosts still alive, we could balance
+    sleep(1);
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {3, 3}});
+    auto ret = balancer.balance();
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
+    sleep(1);
+    LOG(INFO) << "Rebalance finished!";
+    {
+        const auto& prefix = BalancePlan::prefix();
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int num = 0;
+        while (iter->valid()) {
+            auto id = BalancePlan::id(iter->key());
+            auto status = BalancePlan::status(iter->val());
+            ASSERT_EQ(balanceId, id);
+            ASSERT_EQ(BalancePlan::Status::SUCCEEDED, status);
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(1, num);
+    }
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t num = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            {
+                auto tup = BalanceTask::parseKey(iter->key());
+                task.balanceId_ = std::get<0>(tup);
+                ASSERT_EQ(balanceId, task.balanceId_);
+                task.spaceId_ = std::get<1>(tup);
+                ASSERT_EQ(1, task.spaceId_);
+                task.src_ = std::get<3>(tup);
+                task.dst_ = std::get<4>(tup);
+                ASSERT_EQ(HostAddr(2, 2), task.src_);
+                ASSERT_EQ(HostAddr(3, 3), task.dst_);
+            }
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                ASSERT_EQ(BalanceTask::Status::END, task.status_);
+                task.ret_ = std::get<1>(tup);
+                ASSERT_EQ(BalanceTask::Result::SUCCEEDED, task.ret_);
+                task.startTimeMs_ = std::get<2>(tup);
+                ASSERT_GT(task.startTimeMs_, 0);
+                task.endTimeMs_ = std::get<3>(tup);
+                ASSERT_GT(task.endTimeMs_, 0);
+            }
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(12, num);
+    }
+}
+
+TEST(BalanceTest, SingleReplicaTest) {
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 1;
+    TestUtils::createSomeHosts(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(12);
+        properties.set_replica_factor(1);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+    std::unordered_map<HostAddr, int32_t> partCount;
+    for (int32_t i = 0; i < 6; i++) {
+        partCount[HostAddr(i, i)] = 2;
+    }
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+    Balancer balancer(kv.get(), std::move(client));
+
+    sleep(1);
+    LOG(INFO) << "Now, we want to remove host {2, 2} and {3, 3}";
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
+    auto ret = balancer.balance({{2, 2}, {3, 3}, {3, 3}});
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
+    sleep(1);
+    LOG(INFO) << "Rebalance finished!";
+    {
+        const auto& prefix = BalancePlan::prefix();
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int num = 0;
+        while (iter->valid()) {
+            auto id = BalancePlan::id(iter->key());
+            auto status = BalancePlan::status(iter->val());
+            ASSERT_EQ(balanceId, id);
+            ASSERT_EQ(BalancePlan::Status::SUCCEEDED, status);
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(1, num);
+    }
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t num = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            {
+                auto tup = BalanceTask::parseKey(iter->key());
+                task.balanceId_ = std::get<0>(tup);
+                ASSERT_EQ(balanceId, task.balanceId_);
+                task.spaceId_ = std::get<1>(tup);
+                ASSERT_EQ(1, task.spaceId_);
+                task.src_ = std::get<3>(tup);
+                task.dst_ = std::get<4>(tup);
+                partCount[task.src_]--;
+                partCount[task.dst_]++;
+            }
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                ASSERT_EQ(BalanceTask::Status::END, task.status_);
+                task.ret_ = std::get<1>(tup);
+                ASSERT_EQ(BalanceTask::Result::SUCCEEDED, task.ret_);
+                task.startTimeMs_ = std::get<2>(tup);
+                ASSERT_GT(task.startTimeMs_, 0);
+                task.endTimeMs_ = std::get<3>(tup);
+                ASSERT_GT(task.endTimeMs_, 0);
+            }
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(4, num);
+    }
+    ASSERT_EQ(3, partCount[HostAddr(0, 0)]);
+    ASSERT_EQ(3, partCount[HostAddr(1, 1)]);
+    ASSERT_EQ(0, partCount[HostAddr(2, 2)]);
+    ASSERT_EQ(0, partCount[HostAddr(3, 3)]);
+    ASSERT_EQ(3, partCount[HostAddr(4, 4)]);
+    ASSERT_EQ(3, partCount[HostAddr(5, 5)]);
+}
+
 TEST(BalanceTest, RecoveryTest) {
     fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
     std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
-    FLAGS_expired_hosts_check_interval_sec = 1;
     FLAGS_expired_threshold_sec = 1;
     TestUtils::createSomeHosts(kv.get());
     {
@@ -492,12 +823,14 @@ TEST(BalanceTest, RecoveryTest) {
 
     sleep(1);
     LOG(INFO) << "Now, we lost host " << HostAddr(3, 3);
-    TestUtils::registerHB({{0, 0}, {1, 1}, {2, 2}});
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
     std::vector<Status> sts {
                                 Status::OK(),
                                 Status::OK(),
                                 Status::OK(),
                                 Status::Error("catch up data failed!"),
+                                Status::OK(),
+                                Status::OK(),
                                 Status::OK(),
                                 Status::OK(),
                                 Status::OK()};
@@ -506,8 +839,8 @@ TEST(BalanceTest, RecoveryTest) {
     auto client = std::make_unique<AdminClient>(std::move(injector));
     Balancer balancer(kv.get(), std::move(client));
     auto ret = balancer.balance();
-    CHECK(ret.ok());
-    auto balanceId = ret.value();
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
     sleep(1);
     {
         const auto& prefix = BalancePlan::prefix();
@@ -562,8 +895,8 @@ TEST(BalanceTest, RecoveryTest) {
     std::vector<Status> normalSts(7, Status::OK());
     static_cast<TestFaultInjector*>(balancer.client_->faultInjector())->reset(std::move(normalSts));
     ret = balancer.balance();
-    CHECK(ret.ok());
-    balanceId = ret.value();
+    CHECK(ok(ret));
+    balanceId = value(ret);
     sleep(1);
     {
         const auto& prefix = BalancePlan::prefix();
@@ -601,9 +934,8 @@ TEST(BalanceTest, RecoveryTest) {
             {
                 auto tup = BalanceTask::parseVal(iter->val());
                 task.status_ = std::get<0>(tup);
-                ASSERT_EQ(BalanceTask::Status::END, task.status_);
                 task.ret_ = std::get<1>(tup);
-                ASSERT_EQ(BalanceTask::Result::SUCCEEDED, task.ret_);
+                ASSERT_EQ(BalanceTask::Result::INVALID, task.ret_);
                 task.startTimeMs_ = std::get<2>(tup);
                 ASSERT_GT(task.startTimeMs_, 0);
                 task.endTimeMs_ = std::get<3>(tup);
@@ -614,6 +946,349 @@ TEST(BalanceTest, RecoveryTest) {
         }
         ASSERT_EQ(6, num);
     }
+}
+
+TEST(BalanceTest, StopBalanceDataTest) {
+    FLAGS_task_concurrency = 1;
+    fs::TempDir rootPath("/tmp/BalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 1;
+    TestUtils::createSomeHosts(kv.get());
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(8);
+        properties.set_replica_factor(3);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+
+    sleep(1);
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjectorWithSleep(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+    Balancer balancer(kv.get(), std::move(client));
+    auto ret = balancer.balance();
+    CHECK(ok(ret));
+    auto balanceId = value(ret);
+
+    sleep(1);
+    LOG(INFO) << "Rebalance should still in progress";
+    {
+        const auto& prefix = BalancePlan::prefix();
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int num = 0;
+        while (iter->valid()) {
+            auto id = BalancePlan::id(iter->key());
+            auto status = BalancePlan::status(iter->val());
+            ASSERT_EQ(balanceId, id);
+            ASSERT_EQ(BalancePlan::Status::IN_PROGRESS, status);
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(1, num);
+    }
+
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
+    auto stopRet = balancer.stop();
+    CHECK(stopRet.ok());
+    ASSERT_EQ(stopRet.value(), balanceId);
+
+    // wait until the only IN_PROGRESS task finished;
+    sleep(3);
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t taskEnded = 0;
+        int32_t taskStopped = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            // PartitionID partId = std::get<2>(BalanceTask::parseKey(iter->key()));
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                task.ret_ = std::get<1>(tup);
+                task.startTimeMs_ = std::get<2>(tup);
+                task.endTimeMs_ = std::get<3>(tup);
+
+                if (task.status_ == BalanceTask::Status::END) {
+                    taskEnded++;
+                } else {
+                    taskStopped++;
+                }
+            }
+            iter->next();
+        }
+        ASSERT_EQ(1, taskEnded);
+        ASSERT_EQ(5, taskStopped);
+    }
+
+    TestUtils::registerHB(kv.get(), {{0, 0}, {1, 1}, {2, 2}});
+    ret = balancer.balance();
+    CHECK(ok(ret));
+    ASSERT_NE(value(ret), balanceId);
+    // resume stopped plan
+    sleep(1);
+    {
+        const auto& prefix = BalanceTask::prefix(balanceId);
+        std::unique_ptr<kvstore::KVIterator> iter;
+        auto retcode = kv->prefix(kDefaultSpaceId, kDefaultPartId, prefix, &iter);
+        ASSERT_EQ(retcode, kvstore::ResultCode::SUCCEEDED);
+        int32_t num = 0;
+        int32_t taskStarted = 0;
+        int32_t taskEnded = 0;
+        while (iter->valid()) {
+            BalanceTask task;
+            {
+                auto tup = BalanceTask::parseVal(iter->val());
+                task.status_ = std::get<0>(tup);
+                task.ret_ = std::get<1>(tup);
+                task.startTimeMs_ = std::get<2>(tup);
+                task.endTimeMs_ = std::get<3>(tup);
+                if (task.status_ == BalanceTask::Status::END) {
+                    ++taskEnded;
+                } else if (task.status_ == BalanceTask::Status::START) {
+                    ++taskStarted;
+                }
+            }
+            num++;
+            iter->next();
+        }
+        ASSERT_EQ(6, num);
+        EXPECT_EQ(5, taskStarted);
+        EXPECT_EQ(1, taskEnded);
+    }
+}
+
+
+void verifyLeaderBalancePlan(std::unordered_map<HostAddr, std::vector<PartitionID>> leaderCount,
+        size_t minLoad, size_t maxLoad) {
+    for (const auto& hostEntry : leaderCount) {
+        EXPECT_GE(hostEntry.second.size(), minLoad);
+        EXPECT_LE(hostEntry.second.size(), maxLoad);
+    }
+}
+
+TEST(BalanceTest, SimpleLeaderBalancePlanTest) {
+    fs::TempDir rootPath("/tmp/SimpleLeaderBalancePlanTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    std::vector<HostAddr> hosts = {{0, 0}, {1, 1}, {2, 2}};
+    TestUtils::createSomeHosts(kv.get(), hosts);
+    // 9 partition in space 1, 3 replica, 3 hosts
+    TestUtils::assembleSpace(kv.get(), 1, 9, 3, 3);
+
+    std::unique_ptr<AdminClient> client(new AdminClient(kv.get()));
+    std::unique_ptr<Balancer> balancer(new Balancer(kv.get(), std::move(client)));
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {1, 2, 3, 4, 5};
+        hostLeaderMap[HostAddr(1, 1)][1] = {6, 7, 8};
+        hostLeaderMap[HostAddr(2, 2)][1] = {9};
+        auto tempMap = hostLeaderMap;
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 3, 3);
+
+        // check two plan build are same
+        LeaderBalancePlan tempPlan;
+        auto tempLeaderParts = balancer->buildLeaderBalancePlan(&tempMap, 1, tempPlan, false);
+        verifyLeaderBalancePlan(tempLeaderParts, 3, 3);
+        EXPECT_EQ(plan.size(), tempPlan.size());
+        for (size_t i = 0; i < plan.size(); i++) {
+            EXPECT_EQ(plan[i], tempPlan[i]);
+        }
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {1, 2, 3, 4};
+        hostLeaderMap[HostAddr(1, 1)][1] = {5, 6, 7, 8};
+        hostLeaderMap[HostAddr(2, 2)][1] = {9};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 3, 3);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {};
+        hostLeaderMap[HostAddr(1, 1)][1] = {};
+        hostLeaderMap[HostAddr(2, 2)][1] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 3, 3);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {1, 2, 3};
+        hostLeaderMap[HostAddr(1, 1)][1] = {4, 5, 6};
+        hostLeaderMap[HostAddr(2, 2)][1] = {7, 8, 9};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 3, 3);
+    }
+}
+
+TEST(BalanceTest, IntersectHostsLeaderBalancePlanTest) {
+    fs::TempDir rootPath("/tmp/IntersectHostsLeaderBalancePlanTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    std::vector<HostAddr> hosts = {{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}};
+    TestUtils::createSomeHosts(kv.get(), hosts);
+    // 7 partition in space 1, 3 replica, 6 hosts, so not all hosts have intersection parts
+    TestUtils::assembleSpace(kv.get(), 1, 7, 3, 6);
+
+    std::unique_ptr<AdminClient> client(new AdminClient(kv.get()));
+    std::unique_ptr<Balancer> balancer(new Balancer(kv.get(), std::move(client)));
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {4, 5, 6};
+        hostLeaderMap[HostAddr(1, 1)][1] = {};
+        hostLeaderMap[HostAddr(2, 2)][1] = {};
+        hostLeaderMap[HostAddr(3, 3)][1] = {1, 2, 3, 7};
+        hostLeaderMap[HostAddr(4, 4)][1] = {};
+        hostLeaderMap[HostAddr(5, 5)][1] = {};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 1, 2);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {};
+        hostLeaderMap[HostAddr(1, 1)][1] = {5, 6, 7};
+        hostLeaderMap[HostAddr(2, 2)][1] = {};
+        hostLeaderMap[HostAddr(3, 3)][1] = {1, 2};
+        hostLeaderMap[HostAddr(4, 4)][1] = {};
+        hostLeaderMap[HostAddr(5, 5)][1] = {3, 4};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 1, 2);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {};
+        hostLeaderMap[HostAddr(1, 1)][1] = {1, 5};
+        hostLeaderMap[HostAddr(2, 2)][1] = {2, 6};
+        hostLeaderMap[HostAddr(3, 3)][1] = {3, 7};
+        hostLeaderMap[HostAddr(4, 4)][1] = {4};
+        hostLeaderMap[HostAddr(5, 5)][1] = {};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 1, 2);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {5, 6};
+        hostLeaderMap[HostAddr(1, 1)][1] = {1, 7};
+        hostLeaderMap[HostAddr(2, 2)][1] = {};
+        hostLeaderMap[HostAddr(3, 3)][1] = {};
+        hostLeaderMap[HostAddr(4, 4)][1] = {2, 3, 4};
+        hostLeaderMap[HostAddr(5, 5)][1] = {};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 1, 2);
+    }
+    {
+        HostLeaderMap hostLeaderMap;
+        hostLeaderMap[HostAddr(0, 0)][1] = {6};
+        hostLeaderMap[HostAddr(1, 1)][1] = {1, 7};
+        hostLeaderMap[HostAddr(2, 2)][1] = {2};
+        hostLeaderMap[HostAddr(3, 3)][1] = {3};
+        hostLeaderMap[HostAddr(4, 4)][1] = {4};
+        hostLeaderMap[HostAddr(5, 5)][1] = {5};
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan, false);
+        verifyLeaderBalancePlan(leaderParts, 1, 2);
+    }
+}
+
+TEST(BalanceTest, ManyHostsLeaderBalancePlanTest) {
+    fs::TempDir rootPath("/tmp/SimpleLeaderBalancePlanTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    FLAGS_expired_threshold_sec = 600;
+
+    int partCount = 99999;
+    int replica = 3;
+    int hostCount = 100;
+    std::vector<HostAddr> hosts;
+    for (int i = 0; i < hostCount; i++) {
+        hosts.emplace_back(i, i);
+    }
+    TestUtils::createSomeHosts(kv.get(), hosts);
+    TestUtils::assembleSpace(kv.get(), 1, partCount, replica, hostCount);
+
+    float avgLoad = static_cast<float>(partCount) / hostCount;
+    int32_t minLoad = std::floor(avgLoad * (1 - FLAGS_leader_balance_deviation));
+    int32_t maxLoad = std::ceil(avgLoad * (1 + FLAGS_leader_balance_deviation));
+
+    std::unique_ptr<AdminClient> client(new AdminClient(kv.get()));
+    std::unique_ptr<Balancer> balancer(new Balancer(kv.get(), std::move(client)));
+    // chcek several times if they are balanced
+    for (int count = 0; count < 1; count++) {
+        HostLeaderMap hostLeaderMap;
+        // all part will random choose a leader
+        for (int partId = 1; partId <= partCount; partId++) {
+            std::vector<HostAddr> peers;
+            size_t idx = partId;
+            for (int32_t i = 0; i < replica; i++, idx++) {
+                peers.emplace_back(hosts[idx % hostCount]);
+            }
+            ASSERT_EQ(peers.size(), replica);
+            auto leader = peers[folly::Random::rand32(peers.size())];
+            hostLeaderMap[leader][1].emplace_back(partId);
+        }
+
+        LeaderBalancePlan plan;
+        auto leaderParts = balancer->buildLeaderBalancePlan(&hostLeaderMap, 1, plan);
+        verifyLeaderBalancePlan(leaderParts, minLoad, maxLoad);
+    }
+}
+
+TEST(BalanceTest, LeaderBalanceTest) {
+    fs::TempDir rootPath("/tmp/LeaderBalanceTest.XXXXXX");
+    std::unique_ptr<kvstore::KVStore> kv(TestUtils::initKV(rootPath.path()));
+    std::vector<HostAddr> hosts = {{0, 0}, {1, 1}, {2, 2}};
+    TestUtils::createSomeHosts(kv.get(), hosts);
+    TestUtils::assembleSpace(kv.get(), 1, 9, 3, 3);
+    {
+        cpp2::SpaceProperties properties;
+        properties.set_space_name("default_space");
+        properties.set_partition_num(9);
+        properties.set_replica_factor(3);
+        cpp2::CreateSpaceReq req;
+        req.set_properties(std::move(properties));
+        auto* processor = CreateSpaceProcessor::instance(kv.get());
+        auto f = processor->getFuture();
+        processor->process(req);
+        auto resp = std::move(f).get();
+        ASSERT_EQ(cpp2::ErrorCode::SUCCEEDED, resp.code);
+        ASSERT_EQ(1, resp.get_id().get_space_id());
+    }
+
+    std::vector<Status> sts(9, Status::OK());
+    std::unique_ptr<FaultInjector> injector(new TestFaultInjector(std::move(sts)));
+    auto client = std::make_unique<AdminClient>(std::move(injector));
+
+    Balancer balancer(kv.get(), std::move(client));
+    auto ret = balancer.leaderBalance();
+    ASSERT_EQ(ret, cpp2::ErrorCode::SUCCEEDED);
 }
 
 }  // namespace meta

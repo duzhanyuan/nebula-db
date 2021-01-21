@@ -69,7 +69,7 @@ bool ColumnValue::operator < (const ColumnValue& rhs) const {
 }  // namespace cpp2
 
 OrderByExecutor::OrderByExecutor(Sentence *sentence, ExecutionContext *ectx)
-    : TraverseExecutor(ectx) {
+    : TraverseExecutor(ectx, "order_by") {
     sentence_ = static_cast<OrderBySentence*>(sentence);
 }
 
@@ -77,32 +77,14 @@ Status OrderByExecutor::prepare() {
     return Status::OK();
 }
 
-void OrderByExecutor::feedResult(std::unique_ptr<InterimResult> result) {
-    if (result == nullptr) {
+void OrderByExecutor::execute() {
+    auto status = beforeExecute();
+    if (!status.ok()) {
+        LOG(ERROR) << "Error happened before execute: " << status.toString();
+        doError(std::move(status));
         return;
     }
-    DCHECK(sentence_ != nullptr);
-    inputs_ = std::move(result);
-    rows_ = inputs_->getRows();
 
-    auto schema = inputs_->schema();
-    auto factors = sentence_->factors();
-    sortFactors_.reserve(factors.size());
-    for (auto &factor : factors) {
-        auto expr = static_cast<InputPropertyExpression*>(factor->expr());
-        folly::StringPiece field = *(expr->prop());
-        auto fieldIndex = schema->getFieldIndex(field);
-        if (fieldIndex == -1) {
-            LOG(INFO) << "Field(" << field << ") not exist in input schema.";
-            continue;
-        }
-        auto pair = std::make_pair(schema->getFieldIndex(field), factor->orderType());
-        sortFactors_.emplace_back(std::move(pair));
-    }
-}
-
-void OrderByExecutor::execute() {
-    FLOG_INFO("Executing Order By: %s", sentence_->toString().c_str());
     auto comparator = [this] (cpp2::RowValue& lhs, cpp2::RowValue& rhs) {
         const auto &lhsColumns = lhs.get_columns();
         const auto &rhsColumns = rhs.get_columns();
@@ -117,8 +99,6 @@ void OrderByExecutor::execute() {
                 return lhsColumns[fieldIndex] < rhsColumns[fieldIndex];
             } else if (orderType == OrderFactor::OrderType::DESCEND) {
                 return lhsColumns[fieldIndex] > rhsColumns[fieldIndex];
-            } else {
-                LOG(FATAL) << "Unkown Order Type: " << orderType;
             }
         }
         return false;
@@ -129,15 +109,62 @@ void OrderByExecutor::execute() {
     }
 
     if (onResult_) {
-        onResult_(setupInterimResult());
+        auto ret = setupInterimResult();
+        if (!ret.ok()) {
+            onError_(std::move(ret).status());
+            return;
+        }
+        onResult_(std::move(ret).value());
     }
-    DCHECK(onFinish_);
-    onFinish_();
+    doFinish(Executor::ProcessControl::kNext);
 }
 
-std::unique_ptr<InterimResult> OrderByExecutor::setupInterimResult() {
+Status OrderByExecutor::beforeExecute() {
+    if (inputs_ == nullptr) {
+        return Status::OK();
+    }
+
+    auto status = checkIfDuplicateColumn();
+    if (!status.ok()) {
+        return status;
+    }
+    colNames_ = inputs_->getColNames();
+    if (!inputs_->hasData()) {
+        return Status::OK();
+    }
+
+    auto ret = inputs_->getRows();
+    if (!ret.ok()) {
+        LOG(ERROR) << "Get rows failed: " << ret.status();
+        doError(ret.status());
+        return std::move(ret).status();
+    }
+    rows_ = std::move(ret).value();
+    auto schema = inputs_->schema();
+    auto factors = sentence_->factors();
+    sortFactors_.reserve(factors.size());
+    for (auto &factor : factors) {
+        auto expr = static_cast<InputPropertyExpression*>(factor->expr());
+        folly::StringPiece field = *(expr->prop());
+        auto fieldIndex = schema->getFieldIndex(field);
+        if (fieldIndex == -1) {
+            return Status::Error("Field (%s) not exist in input schema.", field.str().c_str());
+        }
+        if (factor->orderType() != OrderFactor::OrderType::ASCEND &&
+                factor->orderType() != OrderFactor::OrderType::DESCEND) {
+            LOG(ERROR) << "Unkown Order Type: " << factor->orderType();
+            return Status::Error("Unkown Order Type: %d", factor->orderType());
+        }
+        auto pair = std::make_pair(schema->getFieldIndex(field), factor->orderType());
+        sortFactors_.emplace_back(std::move(pair));
+    }
+    return Status::OK();
+}
+
+StatusOr<std::unique_ptr<InterimResult>> OrderByExecutor::setupInterimResult() {
+    auto result = std::make_unique<InterimResult>(std::move(colNames_));
     if (rows_.empty()) {
-        return nullptr;
+        return result;
     }
 
     auto schema = inputs_->schema();
@@ -148,6 +175,9 @@ std::unique_ptr<InterimResult> OrderByExecutor::setupInterimResult() {
         auto columns = row.get_columns();
         for (auto &column : columns) {
             switch (column.getType()) {
+                case Type::id:
+                    writer << column.get_id();
+                    break;
                 case Type::integer:
                     writer << column.get_integer();
                     break;
@@ -160,30 +190,27 @@ std::unique_ptr<InterimResult> OrderByExecutor::setupInterimResult() {
                 case Type::str:
                     writer << column.get_str();
                     break;
+                case Type::timestamp:
+                    writer << column.get_timestamp();
+                    break;
                 default:
-                    LOG(FATAL) << "Not Support: " << column.getType();
+                    LOG(ERROR) << "Not Support type: " << column.getType();
+                    return Status::Error("Not Support type: %d", column.getType());
             }
         }
         rsWriter->addRow(writer);
     }
 
-    return std::make_unique<InterimResult>(std::move(rsWriter));
+    result->setInterim(std::move(rsWriter));
+    return result;
 }
 
 void OrderByExecutor::setupResponse(cpp2::ExecutionResponse &resp) {
+    resp.set_column_names(std::move(colNames_));
+
     if (rows_.empty()) {
         return;
     }
-
-    auto schema = inputs_->schema();
-    std::vector<std::string> columnNames;
-    columnNames.reserve(schema->getNumFields());
-    auto field = schema->begin();
-    while (field) {
-        columnNames.emplace_back(field->getName());
-        ++field;
-    }
-    resp.set_column_names(std::move(columnNames));
     resp.set_rows(std::move(rows_));
 }
 

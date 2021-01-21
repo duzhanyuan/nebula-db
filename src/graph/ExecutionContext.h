@@ -15,6 +15,7 @@
 #include "meta/ClientBasedGflagsManager.h"
 #include "graph/VariableHolder.h"
 #include "meta/client/MetaClient.h"
+#include "charset/Charset.h"
 
 /**
  * ExecutionContext holds context infos in the execution process, e.g. clients of storage or meta services.
@@ -33,13 +34,15 @@ public:
                      meta::SchemaManager *sm,
                      meta::ClientBasedGflagsManager *gflagsManager,
                      storage::StorageClient *storage,
-                     meta::MetaClient *metaClient) {
+                     meta::MetaClient *metaClient,
+                     CharsetInfo* charsetInfo) {
         rctx_ = std::move(rctx);
         sm_ = sm;
         gflagsManager_ = gflagsManager;
-        storage_ = storage;
+        storageClient_ = storage;
         metaClient_ = metaClient;
         variableHolder_ = std::make_unique<VariableHolder>();
+        charsetInfo_ = charsetInfo;
     }
 
     ~ExecutionContext();
@@ -56,8 +59,8 @@ public:
         return gflagsManager_;
     }
 
-    storage::StorageClient* storage() const {
-        return storage_;
+    storage::StorageClient* getStorageClient() const {
+        return storageClient_;
     }
 
     VariableHolder* variableHolder() const {
@@ -68,13 +71,27 @@ public:
         return metaClient_;
     }
 
+    CharsetInfo* getCharsetInfo() const {
+        return charsetInfo_;
+    }
+
+    void addWarningMsg(std::string msg) {
+        warnMsgs_.emplace_back(std::move(msg));
+    }
+
+    const std::vector<std::string>& getWarningMsg() const {
+        return warnMsgs_;
+    }
+
 private:
     RequestContextPtr                           rctx_;
     meta::SchemaManager                        *sm_{nullptr};
     meta::ClientBasedGflagsManager             *gflagsManager_{nullptr};
-    storage::StorageClient                     *storage_{nullptr};
+    storage::StorageClient                     *storageClient_{nullptr};
     meta::MetaClient                           *metaClient_{nullptr};
     std::unique_ptr<VariableHolder>             variableHolder_;
+    CharsetInfo                                *charsetInfo_{nullptr};
+    std::vector<std::string>                    warnMsgs_;
 };
 
 }   // namespace graph

@@ -11,6 +11,8 @@
 #include "graph/TraverseExecutor.h"
 #include "storage/client/StorageClient.h"
 
+DECLARE_bool(filter_pushdown);
+
 namespace nebula {
 
 namespace storage {
@@ -20,6 +22,14 @@ class QueryResponse;
 }   // namespace storage
 
 namespace graph {
+
+struct HashPair {
+    template <class T1, class T2> size_t operator()(const std::pair<T1, T2>& p) const {
+        auto hash1 = std::hash<T1>{}(p.first);
+        auto hash2 = std::hash<T2>{}(p.second);
+        return hash1 ^ hash2;
+    }
+};
 
 class GoExecutor final : public TraverseExecutor {
 public:
@@ -33,14 +43,14 @@ public:
 
     void execute() override;
 
-    void feedResult(std::unique_ptr<InterimResult> result) override;
-
     void setupResponse(cpp2::ExecutionResponse &resp) override;
 
 private:
     /**
      * To do some preparing works on the clauses
      */
+    Status prepareClauses();
+
     Status prepareStep();
 
     Status prepareFrom();
@@ -55,6 +65,12 @@ private:
 
     Status prepareDistinct();
 
+    Status prepareOverAll();
+
+    Status addToEdgeTypes(EdgeType type);
+
+    Status checkNeededProps();
+
     /**
      * To check if this is the final step.
      */
@@ -62,20 +78,11 @@ private:
         return curStep_ == steps_;
     }
 
-    /**
-     * To check if `UPTO' is specified.
-     * If so, we are supposed to apply the filter in each step.
-     */
-    bool isUpto() const {
-        return upto_;
-    }
-
-    /**
-     * To check if `REVERSELY' is specified.
-     * If so, we step out in a reverse manner.
-     */
-    bool isReversely() const {
-        return reversely_;
+    // is record the response data
+    // Won't return the properties(only dst) if false
+    // E.G 0-> 1 -> 2, two step
+    bool isRecord() const {
+        return curStep_ >= recordFrom_ && curStep_ <= steps_;
     }
 
     /**
@@ -108,7 +115,9 @@ private:
     StatusOr<std::vector<storage::cpp2::PropDef>> getStepOutProps();
     StatusOr<std::vector<storage::cpp2::PropDef>> getDstProps();
 
-    void fetchVertexProps(std::vector<VertexID> ids, RpcResponse &&rpcResp);
+    void fetchVertexProps(std::vector<VertexID> ids);
+
+    void maybeFinishExecution();
 
     /**
      * To retrieve or generate the column names for the execution result.
@@ -118,18 +127,25 @@ private:
     /**
      * To retrieve the dst ids from a stepping out response.
      */
-    std::vector<VertexID> getDstIdsFromResp(RpcResponse &rpcResp) const;
+    std::vector<VertexID> getDstIdsFromResps(std::vector<RpcResponse>::iterator begin,
+                                             std::vector<RpcResponse>::iterator end) const;
 
+    std::vector<VertexID> getDstIdsFromRespWithBackTrack(const RpcResponse &rpcResp) const;
+
+    /**
+     * get the edgeName when over all edges
+     */
+    std::vector<std::string> getEdgeNames() const;
     /**
      * All required data have arrived, finish the execution.
      */
-    void finishExecution(RpcResponse &&rpcResp);
+    void finishExecution();
 
     /**
      * To setup an intermediate representation of the execution result,
      * which is about to be piped to the next executor.
      */
-    std::unique_ptr<InterimResult> setupInterimResult(RpcResponse &&rpcResp);
+    bool setupInterimResult(std::unique_ptr<InterimResult> &result) const;
 
     /**
      * To setup the header of the execution result, i.e. the column names.
@@ -139,14 +155,18 @@ private:
     /**
      * To setup the body of the execution result.
      */
-    void setupResponseBody(RpcResponse &rpcResp, cpp2::ExecutionResponse &resp) const;
+    bool setupResponseBody(RpcResponse &rpcResp, cpp2::ExecutionResponse &resp) const;
 
     /**
      * To iterate on the final data collection, and evaluate the filter and yield columns.
      * For each row that matches the filter, `cb' would be invoked.
      */
-    using Callback = std::function<void(std::vector<VariantType>)>;
-    void processFinalResult(RpcResponse &rpcResp, Callback cb) const;
+    using Callback = std::function<Status(std::vector<VariantType>,
+                                          const std::vector<nebula::cpp2::SupportedType>&)>;
+
+    bool processFinalResult(Callback cb) const;
+
+    StatusOr<std::vector<cpp2::RowValue>> toThriftResponse() const;
 
     /**
      * A container to hold the mapping from vertex id to its properties, used for lookups
@@ -154,43 +174,89 @@ private:
      */
     class VertexHolder final {
     public:
-        VariantType get(VertexID id, int64_t index) const;
-        void add(const storage::cpp2::QueryResponse &resp);
-        const auto* schema() const {
-            return schema_.get();
+        explicit VertexHolder(ExecutionContext* ectx) : ectx_(ectx) { }
+        OptVariantType getDefaultProp(TagID tid, const std::string &prop) const;
+        OptVariantType get(VertexID id, TagID tid, const std::string &prop) const;
+        void add(const std::vector<storage::cpp2::QueryResponse> &responses);
+
+    private:
+        std::unordered_map<std::pair<VertexID, TagID>, RowReader> data_;
+        mutable std::unordered_map<
+            TagID, std::shared_ptr<const meta::SchemaProviderIf>> tagSchemaMap_;
+        ExecutionContext* ectx_{nullptr};
+    };
+
+    class VertexBackTracker final {
+    public:
+        void inject(const std::unordered_set<std::pair<VertexID, VertexID>, HashPair> &backTrace,
+                uint32_t curStep) {
+            // TODO(shylock) c++17 merge directly
+            for (const auto iter : backTrace) {
+                mapping_.emplace(std::pair<uint32_t, VertexID>(curStep, iter.first), iter.second);
+            }
+        }
+
+        auto get(uint32_t curStep, VertexID id) const {
+            auto range = mapping_.equal_range(std::pair<uint32_t, VertexID>(curStep, id));
+            return range;
         }
 
     private:
-        // The schema include multi vertexes, and multi tags of one vertex
-        // eg: get 3 vertexex, vertex A has tag1.prop1, vertex B has tag2.prop2,
-        // vertex C has tag3.prop3,
-        // and the schema is {[tag1.prop1, type], [tag2.prop2, type], [tag3.prop3, type]}
-        std::shared_ptr<ResultSchemaProvider>       schema_;
-        std::unordered_map<VertexID, std::string>   data_;
+        // Record the path from the dst node of each step to the root node.((curStep,dstID),rootID)
+        std::multimap<std::pair<uint32_t, VertexID>, VertexID> mapping_;
     };
+
+    enum FromType {
+        kInstantExpr,
+        kVariable,
+        kPipe,
+    };
+
+    // Join the RPC response to previous data
+    void joinResp(RpcResponse &&resp);
+
+    std::vector<VertexID> getRoots(VertexID srcId, std::size_t record) const {
+        CHECK_GT(record, 0);
+        std::vector<VertexID> ids;
+        if (record == 1) {
+            ids.emplace_back(srcId);
+            return ids;
+        }
+        const auto range = DCHECK_NOTNULL(backTracker_)->get(record - 1, srcId);
+        for (auto i = range.first; i != range.second; ++i) {
+            ids.emplace_back(i->second);
+        }
+        return ids;
+    }
+
 
 private:
     GoSentence                                 *sentence_{nullptr};
+    FromType                                    fromType_{kInstantExpr};
+    uint32_t                                    recordFrom_{1};
     uint32_t                                    steps_{1};
     uint32_t                                    curStep_{1};
-    bool                                        upto_{false};
-    bool                                        reversely_{false};
-    EdgeType                                    edgeType_;
+    OverClause::Direction                       direction_{OverClause::Direction::kForward};
+    std::vector<EdgeType>                       edgeTypes_;
     std::string                                *varname_{nullptr};
     std::string                                *colname_{nullptr};
-    Expression                                 *filter_{nullptr};
+    std::unique_ptr<WhereWrapper>               whereWrapper_;
     std::vector<YieldColumn*>                   yields_;
+    std::unique_ptr<YieldClauseWrapper>         yieldClauseWrapper_;
     bool                                        distinct_{false};
     bool                                        distinctPushDown_{false};
-    std::unique_ptr<InterimResult>              inputs_;
+    using InterimIndex = InterimResult::InterimResultIndex;
+    std::unique_ptr<InterimIndex>               index_;
     std::unique_ptr<ExpressionContext>          expCtx_;
     std::vector<VertexID>                       starts_;
     std::unique_ptr<VertexHolder>               vertexHolder_;
+    std::unique_ptr<VertexBackTracker>          backTracker_;
     std::unique_ptr<cpp2::ExecutionResponse>    resp_;
+    // Record the data of response in GO step
+    std::vector<RpcResponse>                    records_;
     // The name of Tag or Edge, index of prop in data
     using SchemaPropIndex = std::unordered_map<std::pair<std::string, std::string>, int64_t>;
-    SchemaPropIndex                              srcTagProps_;
-    SchemaPropIndex                              dstTagProps_;
+    std::string                                  warningMsg_;
 };
 
 }   // namespace graph

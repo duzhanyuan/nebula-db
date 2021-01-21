@@ -5,13 +5,15 @@
  */
 
 #include "meta/GflagsManager.h"
+#include "base/Configuration.h"
+#include "fs/FileUtils.h"
 
-DEFINE_int32(load_config_interval_secs, 2 * 60, "Load config interval");
+DEFINE_string(gflags_mode_json, "share/resources/gflags.json", "gflags mode json for service");
 
 namespace nebula {
 namespace meta {
 
-template<typename ValueType>
+template <typename ValueType>
 std::string GflagsManager::gflagsValueToThriftValue(const gflags::CommandLineFlagInfo& flag) {
     std::string ret;
     auto value = folly::to<ValueType>(flag.current_value);
@@ -19,56 +21,127 @@ std::string GflagsManager::gflagsValueToThriftValue(const gflags::CommandLineFla
     return ret;
 }
 
-template<>
+template <>
 std::string GflagsManager::gflagsValueToThriftValue<std::string>(
         const gflags::CommandLineFlagInfo& flag) {
     return flag.current_value;
 }
 
-void GflagsManager::declareGflags() {
-    // declare all gflags in ClientBasedGflagsManager
+std::unordered_map<std::string, std::pair<cpp2::ConfigMode, bool>>
+GflagsManager::parseConfigJson(const std::string& path) {
+    // The default conf for gflags flags mode
+    std::unordered_map<std::string, std::pair<cpp2::ConfigMode, bool>> configModeMap {
+        {"max_edge_returned_per_vertex", {cpp2::ConfigMode::MUTABLE, false}},
+        {"minloglevel", {cpp2::ConfigMode::MUTABLE, false}},
+        {"v", {cpp2::ConfigMode::MUTABLE, false}},
+        {"heartbeat_interval_secs", {cpp2::ConfigMode::MUTABLE, false}},
+        {"meta_client_retry_times", {cpp2::ConfigMode::MUTABLE, false}},
+        {"slow_op_threshhold_ms", {cpp2::ConfigMode::MUTABLE, false}},
+        {"wal_ttl", {cpp2::ConfigMode::MUTABLE, false}},
+        {"enable_reservoir_sampling", {cpp2::ConfigMode::MUTABLE, false}},
+
+        {"rocksdb_db_options", {cpp2::ConfigMode::MUTABLE, true}},
+        {"rocksdb_column_family_options", {cpp2::ConfigMode::MUTABLE, true}},
+        {"rocksdb_block_based_table_options", {cpp2::ConfigMode::MUTABLE, true}},
+    };
+    Configuration conf;
+    if (!conf.parseFromFile(path).ok()) {
+        LOG(ERROR) << "Load gflags json failed";
+        return configModeMap;
+    }
+    static std::vector<std::string> keys = {"MUTABLE"};
+    static std::vector<cpp2::ConfigMode> modes = {cpp2::ConfigMode::MUTABLE};
+    for (size_t i = 0; i < keys.size(); i++) {
+        std::vector<std::string> values;
+        if (!conf.fetchAsStringArray(keys[i].c_str(), values).ok()) {
+            continue;
+        }
+        cpp2::ConfigMode mode = modes[i];
+        for (const auto& name : values) {
+            configModeMap[name] = {mode, false};
+        }
+    }
+    static std::string nested = "NESTED";
+    std::vector<std::string> values;
+    if (conf.fetchAsStringArray(nested.c_str(), values).ok()) {
+        for (const auto& name : values) {
+            // all nested gflags regard as mutable ones
+            configModeMap[name] = {cpp2::ConfigMode::MUTABLE, true};
+        }
+    }
+
+    return configModeMap;
+}
+
+std::vector<cpp2::ConfigItem> GflagsManager::declareGflags(const cpp2::ConfigModule& module) {
+    std::vector<cpp2::ConfigItem> configItems;
+    if (module == cpp2::ConfigModule::UNKNOWN) {
+        return configItems;
+    }
+    auto mutableConfig = parseConfigJson(FLAGS_gflags_mode_json);
+    // Get all flags by listing all defined gflags
     std::vector<gflags::CommandLineFlagInfo> flags;
     gflags::GetAllFlags(&flags);
     for (auto& flag : flags) {
         auto& name = flag.name;
         auto& type = flag.type;
         cpp2::ConfigType cType;
-        // default config type will take effect after reboot
-        cpp2::ConfigMode mode = cpp2::ConfigMode::REBOOT;
-        VariantType value;
         std::string valueStr;
 
-        // TODO: all int32 and uint32 are converted to int64
-        if (type == "uint32" || type == "int32" || type == "int64") {
+        // We only register mutable configs to meta
+        cpp2::ConfigMode mode = cpp2::ConfigMode::MUTABLE;
+        bool isNested = false;
+        auto iter = mutableConfig.find(name);
+        if (iter != mutableConfig.end()) {
+            isNested = iter->second.second;
+        } else {
+            continue;
+        }
+
+        // TODO: all int32/uint32/uint64 gflags are converted to int64 for now
+        if (type == "uint32" || type == "int32" || type == "int64" || type == "uint64") {
             cType = cpp2::ConfigType::INT64;
-            value = folly::to<int64_t>(flag.current_value);
             valueStr = gflagsValueToThriftValue<int64_t>(flag);
         } else if (type == "double") {
             cType = cpp2::ConfigType::DOUBLE;
-            value = folly::to<double>(flag.current_value);
+            valueStr = gflagsValueToThriftValue<double>(flag);
         } else if (type == "bool") {
             cType = cpp2::ConfigType::BOOL;
-            value = folly::to<bool>(flag.current_value);
             valueStr = gflagsValueToThriftValue<bool>(flag);
         } else if (type == "string") {
             cType = cpp2::ConfigType::STRING;
-            value = flag.current_value;
             valueStr = gflagsValueToThriftValue<std::string>(flag);
+            // only string gflags can be nested
+            if (isNested) {
+                cType = cpp2::ConfigType::NESTED;
+            }
         } else {
             LOG(INFO) << "Not able to declare " << name << " of " << type;
             continue;
         }
 
-        if (name == "load_data_interval_secs" || name == "load_config_interval_secs") {
-            mode = cpp2::ConfigMode::MUTABLE;
-        }
-        if (module_ == cpp2::ConfigModule::META) {
-            // all config of meta is immutable for now
-            mode = cpp2::ConfigMode::IMMUTABLE;
-        }
+        configItems.emplace_back(toThriftConfigItem(module, name, cType, mode, valueStr));
+    }
+    LOG(INFO) << "Prepare to register " << configItems.size() << " gflags to meta";
+    return configItems;
+}
 
-        LOG(INFO) << name << " " << value;
-        gflagsDeclared_.emplace_back(toThriftConfigItem(module_, name, cType, mode, valueStr));
+void GflagsManager::getGflagsModule(cpp2::ConfigModule& gflagsModule) {
+    // get current process according to gflags pid_file
+    gflags::CommandLineFlagInfo pid;
+    if (gflags::GetCommandLineFlagInfo("pid_file", &pid)) {
+        auto defaultPid = pid.default_value;
+        if (defaultPid.find("nebula-graphd") != std::string::npos) {
+            gflagsModule = cpp2::ConfigModule::GRAPH;
+        } else if (defaultPid.find("nebula-storaged") != std::string::npos) {
+            gflagsModule = cpp2::ConfigModule::STORAGE;
+        } else if (defaultPid.find("nebula-metad") != std::string::npos) {
+            gflagsModule = cpp2::ConfigModule::META;
+        } else {
+            LOG(ERROR) << "Should not reach here";
+        }
+    } else {
+        LOG(INFO) << "Unknown config module";
     }
 }
 
@@ -90,7 +163,8 @@ std::string toThriftValueStr(const cpp2::ConfigType& type, const VariantType& va
             valueStr.append(reinterpret_cast<const char*>(&val), sizeof(val));
             break;
         }
-        case cpp2::ConfigType::STRING: {
+        case cpp2::ConfigType::STRING:
+        case cpp2::ConfigType::NESTED: {
             valueStr = boost::get<std::string>(value);
             break;
         }
@@ -112,6 +186,5 @@ cpp2::ConfigItem toThriftConfigItem(const cpp2::ConfigModule& module,
     return item;
 }
 
-}  // namespace meta
-}  // namespace nebula
-
+}   // namespace meta
+}   // namespace nebula

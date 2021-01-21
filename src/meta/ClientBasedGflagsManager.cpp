@@ -6,8 +6,6 @@
 
 #include "meta/ClientBasedGflagsManager.h"
 
-DECLARE_int32(load_config_interval_secs);
-
 namespace nebula {
 namespace meta {
 
@@ -18,12 +16,6 @@ ClientBasedGflagsManager::ClientBasedGflagsManager(MetaClient *client) {
 
 ClientBasedGflagsManager::~ClientBasedGflagsManager() {
     metaClient_ = nullptr;
-}
-
-Status ClientBasedGflagsManager::init() {
-    module_ = metaClient_->getGflagsModule();
-    declareGflags();
-    return registerGflags();
 }
 
 template<typename ValueType>
@@ -56,6 +48,7 @@ ClientBasedGflagsManager::setConfig(const cpp2::ConfigModule& module, const std:
         case cpp2::ConfigType::BOOL:
             return set(module, name, type, boost::get<bool>(value));
         case cpp2::ConfigType::STRING:
+        case cpp2::ConfigType::NESTED:
             return set(module, name, type, boost::get<std::string>(value));
         default:
             return Status::Error("parse value type error");
@@ -72,20 +65,10 @@ ClientBasedGflagsManager::listConfigs(const cpp2::ConfigModule& module) {
     return metaClient_->listConfigs(module);
 }
 
-folly::Future<StatusOr<bool>>
-ClientBasedGflagsManager::registerConfig(const cpp2::ConfigModule& module, const std::string& name,
-                                         const cpp2::ConfigType& type, const cpp2::ConfigMode& mode,
-                                         const std::string& value) {
-    auto item = toThriftConfigItem(module, name, type, mode, value);
-    std::vector<cpp2::ConfigItem> items;
-    items.emplace_back(std::move(item));
-    return metaClient_->regConfig(items);
-}
-
-Status ClientBasedGflagsManager::registerGflags() {
-    auto status = metaClient_->regConfig(gflagsDeclared_).get();
+Status ClientBasedGflagsManager::registerGflags(const std::vector<cpp2::ConfigItem>& items) {
+    auto status = metaClient_->regConfig(items).get();
     if (status.ok()) {
-        LOG(INFO) << "Register gflags ok " << gflagsDeclared_.size();
+        LOG(INFO) << "Register gflags ok " << items.size();
         return Status::OK();
     }
     return Status::Error("Register gflags failed");

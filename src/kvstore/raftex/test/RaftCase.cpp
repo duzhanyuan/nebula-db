@@ -11,12 +11,11 @@
 #include "fs/FileUtils.h"
 #include "thread/GenericThreadPool.h"
 #include "network/NetworkUtils.h"
-#include "kvstore/wal/BufferFlusher.h"
 #include "kvstore/raftex/RaftexService.h"
 #include "kvstore/raftex/test/RaftexTestBase.h"
 #include "kvstore/raftex/test/TestShard.h"
 
-DECLARE_uint32(heartbeat_interval);
+DECLARE_uint32(raft_heartbeat_interval_secs);
 
 namespace nebula {
 namespace raftex {
@@ -32,7 +31,7 @@ public:
 };
 
 TEST_F(ThreeRaftTest, LeaderCrashReboot) {
-    FLAGS_heartbeat_interval = 1;
+    FLAGS_raft_heartbeat_interval_secs = 1;
     LOG(INFO) << "=====> Start leaderCrash test";
 
     LOG(INFO) << "=====> Now let's kill the old leader";
@@ -55,7 +54,7 @@ TEST_F(ThreeRaftTest, LeaderCrashReboot) {
     idx = leader_->index();
     killOneCopy(services_, copies_, leader_, idx);
     killOneCopy(services_, copies_, leader_, (idx + 1) % copies_.size());
-    sleep(FLAGS_heartbeat_interval);
+    sleep(FLAGS_raft_heartbeat_interval_secs);
     checkNoLeader(copies_);
 
     LOG(INFO) << "=====> Now one of dead copy rejoin, quorum arises";
@@ -64,7 +63,7 @@ TEST_F(ThreeRaftTest, LeaderCrashReboot) {
 
     LOG(INFO) << "=====> Now all copy rejoin, should not disrupt leader";
     rebootOneCopy(services_, copies_, allHosts_, idx);
-    sleep(FLAGS_heartbeat_interval);
+    sleep(FLAGS_raft_heartbeat_interval_secs);
     waitUntilAllHasLeader(copies_);
     checkLeadership(copies_, leader_);
 
@@ -101,8 +100,7 @@ TEST_F(ThreeRaftTest, ConsensusWhenFollowDisconnect) {
     LOG(INFO) << "<===== Done ConsensusWhenFollowDisconnect test";
 }
 
-// this ut will cause none was elected when quorum arises, see issue #685
-TEST_F(ThreeRaftTest, DISABLED_LeaderCrashRebootWithLogs) {
+TEST_F(ThreeRaftTest, LeaderCrashRebootWithLogs) {
     LOG(INFO) << "=====> Start LeaderNetworkFailure test";
 
     std::vector<std::string> msgs;
@@ -161,9 +159,10 @@ TEST_F(ThreeRaftTest, Persistance) {
         killOneCopy(services_, copies_, leader_, idx);
         rebootOneCopy(services_, copies_, allHosts_, idx);
         if (waitForNewLeader) {
-            waitUntilLeaderElected(copies_, leader_);
+            waitUntilAllHasLeader(copies_);
         }
     }
+    sleep(FLAGS_raft_heartbeat_interval_secs);
     checkConsensus(copies_, 0, 9, msgs);
     LOG(INFO) << "<===== Done persistance test";
 }
@@ -205,7 +204,7 @@ TEST_F(FiveRaftTest, DISABLED_Figure8) {
 
         if (alive < quorum) {
             size_t idx = folly::Random::rand32(size_);
-            if (!copies_[idx]->isRunning_) {
+            if (!copies_[idx]->isRunning()) {
                 rebootOneCopy(services_, copies_, allHosts_, idx);
                 ++alive;
             }
@@ -214,13 +213,13 @@ TEST_F(FiveRaftTest, DISABLED_Figure8) {
 
     LOG(INFO) << "=====> Now let's reboot all copy and check consensus";
     for (int32_t i = 0; i < size_; i++) {
-        if (!copies_[i]->isRunning_) {
+        if (!copies_[i]->isRunning()) {
             rebootOneCopy(services_, copies_, allHosts_, i);
         }
     }
 
     // wait until all has been committed
-    sleep(5 * FLAGS_heartbeat_interval);
+    sleep(5 * FLAGS_raft_heartbeat_interval_secs);
     size_t count = leader_->getNumLogs();
     LOG(INFO) << "=====> Check all copies have " << count << " logs";
 
@@ -249,10 +248,6 @@ int main(int argc, char** argv) {
     testing::InitGoogleTest(&argc, argv);
     folly::init(&argc, &argv, true);
     google::SetStderrLogging(google::INFO);
-
-    // `flusher' is extern-declared in RaftexTestBase.h, defined in RaftexTestBase.cpp
-    using nebula::raftex::flusher;
-    flusher = std::make_unique<nebula::wal::BufferFlusher>();
 
     return RUN_ALL_TESTS();
 }

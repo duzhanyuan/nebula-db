@@ -17,6 +17,10 @@
 namespace nebula {
 namespace meta {
 
+using HostLeaderMap = std::unordered_map<HostAddr,
+                                         std::unordered_map<GraphSpaceID,
+                                                            std::vector<PartitionID>>>;
+
 class FaultInjector {
 public:
     virtual ~FaultInjector() = default;
@@ -27,6 +31,13 @@ public:
     virtual folly::Future<Status> memberChange() = 0;
     virtual folly::Future<Status> updateMeta() = 0;
     virtual folly::Future<Status> removePart() = 0;
+    virtual folly::Future<Status> checkPeers() = 0;
+    virtual folly::Future<Status> getLeaderDist(HostLeaderMap* hostLeaderMap) = 0;
+    virtual folly::Future<Status> createSnapshot() = 0;
+    virtual folly::Future<Status> dropSnapshot() = 0;
+    virtual folly::Future<Status> blockingWrites() = 0;
+    virtual folly::Future<Status> rebuildTagIndex() = 0;
+    virtual folly::Future<Status> rebuildEdgeIndex() = 0;
 };
 
 static const HostAddr kRandomPeer(0, 0);
@@ -59,11 +70,22 @@ public:
                                   const HostAddr& host,
                                   bool asLearner);
 
-    folly::Future<Status> addLearner(GraphSpaceID spaceId, PartitionID partId);
+    folly::Future<Status> addLearner(GraphSpaceID spaceId,
+                                     PartitionID partId,
+                                     const HostAddr& learner);
 
-    folly::Future<Status> waitingForCatchUpData(GraphSpaceID spaceId, PartitionID partId);
+    folly::Future<Status> waitingForCatchUpData(GraphSpaceID spaceId,
+                                                PartitionID partId,
+                                                const HostAddr& target);
 
-    folly::Future<Status> memberChange(GraphSpaceID spaceId, PartitionID partId);
+    /**
+     * Add/Remove one peer for raft group (spaceId, partId).
+     * "added" should be true if we want to add one peer, otherwise it is false.
+     * */
+    folly::Future<Status> memberChange(GraphSpaceID spaceId,
+                                       PartitionID partId,
+                                       const HostAddr& peer,
+                                       bool added);
 
     folly::Future<Status> updateMeta(GraphSpaceID spaceId,
                                      PartitionID partId,
@@ -73,6 +95,35 @@ public:
     folly::Future<Status> removePart(GraphSpaceID spaceId,
                                      PartitionID partId,
                                      const HostAddr& host);
+
+    folly::Future<Status> checkPeers(GraphSpaceID spaceId,
+                                     PartitionID partId);
+
+    folly::Future<Status> getLeaderDist(HostLeaderMap* result);
+
+    folly::Future<Status> createSnapshot(GraphSpaceID spaceId,
+                                         const std::string& name,
+                                         const HostAddr& host);
+
+    folly::Future<Status> dropSnapshot(GraphSpaceID spaceId,
+                                       const std::string& name,
+                                       const HostAddr& host);
+
+    folly::Future<Status> blockingWrites(GraphSpaceID spaceId,
+                                         storage::cpp2::EngineSignType sign,
+                                         const HostAddr& host);
+
+    folly::Future<Status> rebuildTagIndex(const HostAddr& address,
+                                          GraphSpaceID spaceId,
+                                          IndexID indexID,
+                                          std::vector<PartitionID> parts,
+                                          bool isOffline);
+
+    folly::Future<Status> rebuildEdgeIndex(const HostAddr& address,
+                                           GraphSpaceID spaceId,
+                                           IndexID indexID,
+                                           std::vector<PartitionID> parts,
+                                           bool isOffline);
 
     FaultInjector* faultInjector() {
         return injector_.get();
@@ -96,9 +147,14 @@ private:
                      folly::Promise<Status> pro,
                      int32_t retryLimit);
 
+    void getLeaderDist(const HostAddr& host,
+                       folly::Promise<StatusOr<storage::cpp2::GetLeaderResp>>&& pro,
+                       int32_t retry,
+                       int32_t retryLimit);
+
     Status handleResponse(const storage::cpp2::AdminExecResp& resp);
 
-    nebula::cpp2::HostAddr to(const HostAddr& addr);
+    nebula::cpp2::HostAddr toThriftHost(const HostAddr& addr);
 
     StatusOr<std::vector<HostAddr>> getPeers(GraphSpaceID spaceId, PartitionID partId);
 

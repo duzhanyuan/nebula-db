@@ -8,8 +8,9 @@
 #include "graph/test/TestEnv.h"
 #include "meta/test/TestUtils.h"
 #include "storage/test/TestUtils.h"
+#include "meta/RootUserMan.h"
 
-DECLARE_int32(load_data_interval_secs);
+DECLARE_int32(heartbeat_interval_secs);
 DECLARE_string(meta_server_addrs);
 
 namespace nebula {
@@ -27,11 +28,13 @@ TestEnv::~TestEnv() {
 
 
 void TestEnv::SetUp() {
-    FLAGS_load_data_interval_secs = 1;
+    FLAGS_heartbeat_interval_secs = 1;
+    const nebula::ClusterID kClusterId = 10;
     // Create metaServer
     metaServer_ = nebula::meta::TestUtils::mockMetaServer(
                                                     network::NetworkUtils::getAvailablePort(),
-                                                    metaRootPath_.path());
+                                                    metaRootPath_.path(),
+                                                    kClusterId);
     FLAGS_meta_server_addrs = folly::stringPrintf("127.0.0.1:%d", metaServerPort());
 
     // Create storageServer
@@ -45,16 +48,21 @@ void TestEnv::SetUp() {
         LOG(ERROR) << "Bad local host addr, status:" << hostRet.status();
     }
     auto& localhost = hostRet.value();
+
+    if (!nebula::meta::RootUserMan::initRootUser(metaServer_->kvStore_.get())) {
+        LOG(ERROR) << "Init root user failed";
+    }
+
+    meta::MetaClientOptions options;
+    options.localHost_ = localhost;
+    options.clusterId_ = kClusterId;
+    options.inStoraged_ = true;
     mClient_ = std::make_unique<meta::MetaClient>(threadPool,
                                                   std::move(addrsRet.value()),
-                                                  localhost,
-                                                  true);
-    auto r = mClient_->addHosts({localhost}).get();
-    ASSERT_TRUE(r.ok());
+                                                  options);
     mClient_->waitForMetadReady();
-    r = mClient_->removeHosts({localhost}).get();
-    ASSERT_TRUE(r.ok());
     gflagsManager_ = std::make_unique<meta::ClientBasedGflagsManager>(mClient_.get());
+
     IPv4 localIp;
     nebula::network::NetworkUtils::ipv4ToInt("127.0.0.1", localIp);
     storageServer_ = nebula::storage::TestUtils::mockStorageServer(
@@ -71,9 +79,10 @@ void TestEnv::SetUp() {
 
 void TestEnv::TearDown() {
     // TO make sure the drop space be invoked on storage server
-    sleep(FLAGS_load_data_interval_secs + 1);
+    sleep(FLAGS_heartbeat_interval_secs + 1);
     graphServer_.reset();
     storageServer_.reset();
+    mClient_.reset();
     metaServer_.reset();
     mClient_.reset();
 }
@@ -90,9 +99,10 @@ uint16_t TestEnv::storageServerPort() const {
     return storageServer_->port_;
 }
 
-std::unique_ptr<GraphClient> TestEnv::getClient() const {
+std::unique_ptr<GraphClient> TestEnv::getClient(const std::string& user,
+                                                const std::string& password) const {
     auto client = std::make_unique<GraphClient>("127.0.0.1", graphServerPort());
-    if (cpp2::ErrorCode::SUCCEEDED != client->connect("user", "password")) {
+    if (cpp2::ErrorCode::SUCCEEDED != client->connect(user, password)) {
         return nullptr;
     }
     return client;
@@ -100,6 +110,14 @@ std::unique_ptr<GraphClient> TestEnv::getClient() const {
 
 meta::ClientBasedGflagsManager* TestEnv::gflagsManager() {
     return gflagsManager_.get();
+}
+
+test::ServerContext* TestEnv::storageServer() {
+    return storageServer_.get();
+}
+
+meta::MetaClient* TestEnv::metaClient() {
+    return mClient_.get();
 }
 
 }   // namespace graph

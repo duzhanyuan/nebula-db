@@ -9,9 +9,11 @@
 
 #include "base/Base.h"
 #include <rocksdb/compaction_filter.h>
-#include "base/NebulaKeyUtils.h"
+#include "utils/NebulaKeyUtils.h"
 #include "time/WallClock.h"
 #include "kvstore/Common.h"
+
+DECLARE_int32(custom_filter_interval_secs);
 
 namespace nebula {
 namespace kvstore {
@@ -44,33 +46,23 @@ private:
 
 class KVCompactionFilterFactory : public rocksdb::CompactionFilterFactory {
 public:
-    KVCompactionFilterFactory() = default;
+    explicit KVCompactionFilterFactory(GraphSpaceID spaceId) : spaceId_(spaceId) {}
 
     virtual ~KVCompactionFilterFactory() = default;
-
-    /**
-     * We should call construct explicitly becasue the instacne is passed by modules outside.
-     * */
-    void construct(GraphSpaceID spaceId, int32_t customFilterIntervalSecs) {
-        spaceId_ = spaceId;
-        customFilterIntervalSecs_ = customFilterIntervalSecs;
-    }
 
     std::unique_ptr<rocksdb::CompactionFilter>
     CreateCompactionFilter(const rocksdb::CompactionFilter::Context& context) override {
         auto now = time::WallClock::fastNowInSec();
-        if (context.is_full_compaction) {
-            LOG(INFO) << "Do full compaction!";
+        if (context.is_full_compaction || context.is_manual_compaction) {
+            LOG(INFO) << "Do full/manual compaction!";
             lastRunCustomFilterTimeSec_ = now;
-            return std::unique_ptr<rocksdb::CompactionFilter>(
-                            new KVCompactionFilter(spaceId_, createKVFilter()));
+            return std::make_unique<KVCompactionFilter>(spaceId_, createKVFilter());
         } else {
-            if (customFilterIntervalSecs_ >= 0
-                    && now - lastRunCustomFilterTimeSec_ > customFilterIntervalSecs_) {
+            if (FLAGS_custom_filter_interval_secs >= 0
+                    && now - lastRunCustomFilterTimeSec_ > FLAGS_custom_filter_interval_secs) {
                 LOG(INFO) << "Do custom minor compaction!";
                 lastRunCustomFilterTimeSec_ = now;
-                return std::unique_ptr<rocksdb::CompactionFilter>(
-                            new KVCompactionFilter(spaceId_, createKVFilter()));
+                return std::make_unique<KVCompactionFilter>(spaceId_, createKVFilter());
             }
             LOG(INFO) << "Do default minor compaction!";
             return std::unique_ptr<rocksdb::CompactionFilter>(nullptr);
@@ -85,14 +77,19 @@ public:
 
 private:
     GraphSpaceID spaceId_;
-    // -1 means always do default minor compaction.
-    // 0 means always do custom minor compaction
-    int32_t customFilterIntervalSecs_ = 0;
     int32_t lastRunCustomFilterTimeSec_ = 0;
 };
 
+class CompactionFilterFactoryBuilder {
+public:
+    CompactionFilterFactoryBuilder() = default;
 
-}  // namespace kvstore
-}  // namespace nebula
-#endif  // KVSTORE_COMPACTIONFILTER_H_
+    virtual ~CompactionFilterFactoryBuilder() = default;
 
+    virtual std::shared_ptr<KVCompactionFilterFactory>
+    buildCfFactory(GraphSpaceID spaceId) = 0;
+};
+
+}   // namespace kvstore
+}   // namespace nebula
+#endif   // KVSTORE_COMPACTIONFILTER_H_
